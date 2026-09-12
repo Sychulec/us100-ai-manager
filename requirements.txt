@@ -1,0 +1,6 @@
+Flask
+requests
+openai
+ctrader-open-api
+Twisted
+service_identity
