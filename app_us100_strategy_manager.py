@@ -60,7 +60,7 @@ from twisted.internet import reactor
 
 app = Flask(__name__)
 
-print("[BOOT] US100 V1 USING PROVEN V7 CTRADER MARKET CORE")
+print("[BOOT] US100 V9 DEMO | M15 TUNNEL ENTRY | M15 MANAGER + H1 CONTEXT")
 
 
 # ============================================================
@@ -74,26 +74,24 @@ CTRADER_REDIRECT_URI = os.environ.get("CTRADER_REDIRECT_URI")
 # Klucz potrzebny do /auto/on i /auto/off
 AUTO_CONTROL_KEY = os.environ.get("AUTO_CONTROL_KEY", "")
 
-FTMO_START_BALANCE = 100000.0
-
-BASE_RISK_PERCENT = 0.50
-OWN_DAILY_STOP_PERCENT = 1.00
-MAX_TRADES_PER_DAY = 2
-MAX_OPEN_POSITIONS = 2
-
-MIN_SIGNAL_SCORE = 68
+ACCOUNT_REFERENCE_BALANCE = 10000.0
+MAX_TRADES_PER_DAY = 99
+MAX_OPEN_POSITIONS = 1
+MIN_SIGNAL_SCORE = 68  # legacy analysis display only; does NOT gate TV entries
 AUTO_REFRESH_SECONDS = 300
 
-# V7: strategia TradingView wybiera wejście, bot tylko wykonuje i prowadzi pozycję.
-TARGET_TRADER_LOGIN = 17188951
-print(f"[CTRADER] LIVE ROUTE | TARGET traderLogin={TARGET_TRADER_LOGIN} | US100 ONLY")
+# V7: strategia TradingView wybiera wejĹcie, bot tylko wykonuje i prowadzi pozycjÄ.
+TARGET_TRADER_LOGIN = 5901967
+print(f"[CTRADER] DEMO ONLY | TARGET traderLogin={TARGET_TRADER_LOGIN} | US TECH 100")
 STRATEGY_ONLY_MODE = True
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 MANAGER_INTERVAL_SECONDS = int(os.environ.get("MANAGER_INTERVAL_SECONDS", "60"))
-FIXED_LOTS_US100 = float(os.environ.get("FIXED_LOTS_US100", "1.00"))
+FIXED_LOTS_US100 = float(os.environ.get("FIXED_LOTS_US100", "1.50"))
+M15_TUNNEL_LENGTH = int(os.environ.get("M15_TUNNEL_LENGTH", "100"))
+M15_TUNNEL_DEV = float(os.environ.get("M15_TUNNEL_DEV", "2.0"))
 MANAGER_MODEL = os.environ.get("MANAGER_MODEL", "gpt-5-mini")
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -102,7 +100,7 @@ ALLOWED_INSTRUMENTS = (
     "US100",
 )
 
-BOT_LABEL = "US100_AI_MANAGER_V1"
+BOT_LABEL = "US100_V8_TUNNEL_MANAGER"
 
 # Persistent Disk on Render should be mounted at /var/data.
 # You can override the directory with BOT_STATE_DIR.
@@ -116,7 +114,7 @@ BOT_STATE_FILE = os.path.join(
 )
 
 # Default is OFF only when there is no saved state.
-# If saved state says AUTO was ON, V6.1 can restore it after restart.
+# If saved state says AUTO was ON, V8 can restore it after restart.
 auto_trading_enabled = False
 
 
@@ -204,7 +202,7 @@ def save_persistent_state():
         return False
 
     payload = {
-        "version": "6.3",
+        "version": "8.0",
 
         "access_token":
             ctrader_state.get(
@@ -484,7 +482,6 @@ def empty_symbol():
 
 
 market_state = {
-    "XAUUSD": empty_symbol(),
     "US100": empty_symbol(),
 }
 
@@ -533,18 +530,14 @@ def normalize_symbol(name):
 
 def detect_instrument(name):
     value = normalize_symbol(name)
-
-    if "XAUUSD" in value or value == "GOLD":
-        return "XAUUSD"
-
     if (
         "US100" in value
         or "NAS100" in value
         or "USTEC" in value
+        or "USTECH100" in value
         or "NASDAQ100" in value
     ):
         return "US100"
-
     return None
 
 
@@ -581,10 +574,10 @@ def trendbar_to_dict(bar, digits):
 
 
 # ============================================================
-# FTMO DAY
+# TRADING DAY
 # ============================================================
 
-def ftmo_day():
+def trading_day():
     return datetime.now(
         ZoneInfo("Europe/Prague")
     ).strftime("%Y-%m-%d")
@@ -597,11 +590,11 @@ def current_equity():
     if ctrader_state["balance"] is not None:
         return ctrader_state["balance"]
 
-    return FTMO_START_BALANCE
+    return ACCOUNT_REFERENCE_BALANCE
 
 
 def reset_daily_state_if_needed():
-    today = ftmo_day()
+    today = trading_day()
 
     if trade_state["day"] == today:
         return
@@ -632,43 +625,24 @@ def daily_loss_percent():
 
 
 # ============================================================
-# RISK ENGINE
+# ACCOUNT INFO (V8 does NOT size by risk; US100 uses fixed lots)
 # ============================================================
 
+def account_drawdown_percent():
+    equity = current_equity()
+    if ACCOUNT_REFERENCE_BALANCE <= 0:
+        return 0.0
+    return max(0.0, (ACCOUNT_REFERENCE_BALANCE - equity) / ACCOUNT_REFERENCE_BALANCE * 100.0)
+
+
 def calculate_risk(equity):
-    drawdown_percent = max(
-        0.0,
-        (
-            FTMO_START_BALANCE
-            - equity
-        )
-        / FTMO_START_BALANCE
-        * 100.0,
-    )
-
-    if drawdown_percent >= 2.0:
-        risk_percent = 0.25
-
-    elif drawdown_percent >= 1.0:
-        risk_percent = 0.35
-
-    else:
-        risk_percent = BASE_RISK_PERCENT
-
+    # Compatibility for old analysis/status endpoints only.
+    # V8 order sizing NEVER uses this value; orders use FIXED_LOTS_US100.
+    dd = max(0.0, (ACCOUNT_REFERENCE_BALANCE - float(equity)) / ACCOUNT_REFERENCE_BALANCE * 100.0)
     return {
-        "drawdown_percent": round(
-            drawdown_percent,
-            3,
-        ),
-
-        "risk_percent": risk_percent,
-
-        "risk_usd": round(
-            equity
-            * risk_percent
-            / 100.0,
-            2,
-        ),
+        "drawdown_percent": round(dd, 3),
+        "risk_percent": 0.0,
+        "risk_usd": 0.0,
     }
 
 
@@ -1570,7 +1544,7 @@ def structural_stop(
 def analyse_instrument(instrument):
     data = market_state[instrument]
 
-    # V6.3: H4 is context only. H1/M15 drive intraday direction,
+    # V8: H4 is context only. H1/M15 drive intraday direction,
     # M5 refines timing. H4 no longer delays a valid counter-trend move.
     weights = {
         "H4": 0.00,
@@ -1668,7 +1642,7 @@ def analyse_instrument(instrument):
     ):
         decision = "SHORT"
 
-    # V6.3 REVERSAL/FLIP:
+    # V8 REVERSAL/FLIP:
     # If H4 still shows the old trend but H1+M15 have already turned
     # structurally, allow an earlier intraday entry. H4 remains observation.
     m5_bias = (
@@ -1944,7 +1918,7 @@ def size_position(
             "reason": "ZLY_SL",
         }
 
-    # Dla naszych XAUUSD / US100
+    # Dla naszych US100
     # P/L w USD ~ jednostki * zmiana ceny.
     units = (
         risk_usd
@@ -2083,7 +2057,7 @@ def can_trade(
 
     if (
         daily_loss_percent()
-        >= OWN_DAILY_STOP_PERCENT
+        >= 0.0
     ):
         return False, "STOP_DZIENNY"
 
@@ -2339,8 +2313,8 @@ def submit_market_order(
 # ============================================================
 
 def evaluate_auto_trading():
-    # V7: nie otwieramy transakcji z wewnętrznego skanera.
-    # Źródłem wejścia jest wyłącznie sygnał strategii TradingView.
+    # V7: nie otwieramy transakcji z wewnÄtrznego skanera.
+    # ĹšrĂłdĹem wejĹcia jest wyĹÄcznie sygnaĹ strategii TradingView.
     if STRATEGY_ONLY_MODE:
         return
 
@@ -2659,7 +2633,7 @@ def request_account_data(client):
         flush=True,
     )
 
-    # 1. SYMBOL LIST FIRST — this is required for US100 market readiness.
+    # 1. SYMBOL LIST FIRST â this is required for US100 market readiness.
     symbols_ready = all(
         market_state[instrument]["found"]
         for instrument in ALLOWED_INSTRUMENTS
@@ -3014,7 +2988,7 @@ def start_ctrader_connection():
         return
 
     ctrader_client = Client(
-        EndPoints.PROTOBUF_LIVE_HOST,
+        EndPoints.PROTOBUF_DEMO_HOST,
         EndPoints.PROTOBUF_PORT,
         TcpProtocol,
     )
@@ -3154,6 +3128,14 @@ def start_ctrader_connection():
                 return
 
             account = matching_accounts[0]
+
+            # V8 is DEMO-ONLY. Never authorize a live account.
+            if bool(getattr(account, "isLive", False)):
+                ctrader_state["account_id"] = None
+                ctrader_state["account_authorized"] = False
+                set_error(f"V8 DEMO ONLY: traderLogin={TARGET_TRADER_LOGIN} is LIVE")
+                print("[CTRADER] BLOCKED LIVE ACCOUNT", flush=True)
+                return
 
             # IMPORTANT:
             # All Open API requests use the INTERNAL ctidTraderAccountId,
@@ -3925,12 +3907,9 @@ def extract_number(pattern, text):
 
 
 def parse_strategy_alert(text):
-    upper = text.upper()
+    """Parse the exact TradingView alert produced by the M15 tunnel strategy."""
+    upper = str(text).upper()
 
-    # Robust normalization for TradingView text:
-    # - handles Polish diacritics (WEJŚCIE -> WEJSCIE),
-    # - handles Unicode composed/decomposed characters,
-    # - tolerates extra spaces/newlines.
     normalized = unicodedata.normalize("NFKD", upper)
     normalized = "".join(
         ch for ch in normalized
@@ -3938,9 +3917,6 @@ def parse_strategy_alert(text):
     )
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    # Avoid fragile regex boundaries here: TradingView text may contain
-    # non-breaking spaces / Unicode variants. After normalization, simple
-    # token matching is the most reliable.
     if "WEJSCIE LONG" in normalized:
         side = "LONG"
     elif "WEJSCIE SHORT" in normalized:
@@ -3948,18 +3924,30 @@ def parse_strategy_alert(text):
     else:
         side = None
 
-    symbol = detect_instrument(upper)
-    tf_match = re.search(r"(?:XAUUSD|GOLD|US100|NAS100|USTEC)\s+([A-Za-z0-9]+)\s*-", text, re.IGNORECASE)
-    timeframe = tf_match.group(1) if tf_match else "?"
+    symbol_match = re.search(
+        r"SYMBOL\s*:\s*([^|]+)",
+        normalized,
+        re.IGNORECASE,
+    )
+    symbol_raw = symbol_match.group(1).strip() if symbol_match else ""
+    symbol = detect_instrument(symbol_raw)
+
+    tf_match = re.search(
+        r"TF\s*:\s*([^|]+)",
+        normalized,
+        re.IGNORECASE,
+    )
+    timeframe = tf_match.group(1).strip().lower() if tf_match else "?"
 
     return {
         "event": "ENTRY" if side else "UNKNOWN",
         "side": side,
         "symbol": symbol,
+        "symbol_raw": symbol_raw,
         "timeframe": timeframe,
-        "strategy_entry": extract_number(r"Cena:\s*([0-9.,]+)", text),
-        "strategy_tp": extract_number(r"TP:\s*([0-9.,]+)", text),
-        "strategy_sl": extract_number(r"SL:\s*([0-9.,]+)", text),
+        "strategy_entry": extract_number(r"CENA\s*:\s*([0-9.,]+)", normalized),
+        "strategy_tp": extract_number(r"TP\s*:\s*([0-9.,]+)", normalized),
+        "strategy_sl": extract_number(r"SL\s*:\s*([0-9.,]+)", normalized),
         "raw": text,
     }
 
@@ -3989,42 +3977,39 @@ def latest_market_price(instrument):
 def submit_strategy_market_order(signal):
     instrument = signal["symbol"]
     if ctrader_client is None or not ctrader_state.get("account_authorized"):
-        send_telegram_message("⚠️ cTrader nie jest gotowy. Sygnał nie został wykonany.")
+        send_telegram_message("â ď¸ cTrader nie jest gotowy. SygnaĹ nie zostaĹ wykonany.")
         return
     if instrument not in ALLOWED_INSTRUMENTS:
         return
     if market_state[instrument].get("symbol_id") is None:
-        send_telegram_message(f"⚠️ {instrument}: brak symbolu cTrader.")
+        send_telegram_message(f"â ď¸ {instrument}: brak symbolu cTrader.")
         return
     if market_state[instrument]["symbol_id"] in open_position_symbol_ids():
-        send_telegram_message(f"⚠️ {instrument}: pozycja już jest otwarta. Nowy sygnał pominięty.")
+        send_telegram_message(f"â ď¸ {instrument}: pozycja juĹź jest otwarta. Nowy sygnaĹ pominiÄty.")
         return
 
     entry = signal.get("strategy_entry") or latest_market_price(instrument)
     sl = signal.get("strategy_sl")
     tp = signal.get("strategy_tp")
     if entry is None or sl is None or tp is None:
-        send_telegram_message(f"⚠️ {instrument}: sygnał bez pełnego Cena/SL/TP. Nie otwieram.")
+        send_telegram_message(f"â ď¸ {instrument}: sygnaĹ bez peĹnego Cena/SL/TP. Nie otwieram.")
         return
 
-    # Walidacja kierunku poziomów - nie zmieniamy strategii, tylko odrzucamy technicznie błędny alert.
+    # Walidacja kierunku poziomĂłw - nie zmieniamy strategii, tylko odrzucamy technicznie bĹÄdny alert.
     if signal["side"] == "LONG" and not (sl < entry < tp):
-        send_telegram_message(f"⚠️ {instrument}: błędny układ cen LONG. Cena {entry}, SL {sl}, TP {tp}.")
+        send_telegram_message(f"â ď¸ {instrument}: bĹÄdny ukĹad cen LONG. Cena {entry}, SL {sl}, TP {tp}.")
         return
     if signal["side"] == "SHORT" and not (tp < entry < sl):
-        send_telegram_message(f"⚠️ {instrument}: błędny układ cen SHORT. Cena {entry}, SL {sl}, TP {tp}.")
+        send_telegram_message(f"â ď¸ {instrument}: bĹÄdny ukĹad cen SHORT. Cena {entry}, SL {sl}, TP {tp}.")
         return
 
-    lots = FIXED_LOTS_US100 if instrument == "US100" else 0.0
-    volume_raw = fixed_volume_for_lots(instrument, lots) if lots > 0 else None
+    lots = FIXED_LOTS_US100
+    volume_raw = fixed_volume_for_lots(instrument, lots)
     if volume_raw is None:
-        # fallback do starego risk engine dla innych instrumentów
-        sizing = size_position(instrument, entry, sl, calculate_risk(current_equity())["risk_usd"])
-        if not sizing.get("ok"):
-            send_telegram_message(f"⚠️ {instrument}: nie mogę wyliczyć wolumenu: {sizing.get('reason')}")
-            return
-        volume_raw = int(sizing["volume_raw"])
-        lots = sizing.get("lots")
+        send_telegram_message(
+            f"â ď¸ {instrument}: brak danych lotSize/min/max/step â nie otwieram pozycji."
+        )
+        return
 
     req = ProtoOANewOrderReq()
     req.ctidTraderAccountId = int(ctrader_state["account_id"])
@@ -4045,6 +4030,7 @@ def submit_strategy_market_order(signal):
         "source": "TRADINGVIEW",
         "instrument": instrument,
         "decision": signal["side"],
+        "entry_timeframe": signal.get("timeframe", "?"),
         "entry_reference": entry,
         "sl_reference": sl,
         "tp_reference": tp,
@@ -4056,10 +4042,10 @@ def submit_strategy_market_order(signal):
     save_persistent_state()
 
     send_telegram_message(
-        f"📥 {instrument} {signal['side']} — SYGNAŁ STRATEGII\n"
+        f"đĽ {instrument} {signal['side']} â SYGNAĹ STRATEGII\n"
         f"Cena strategii: {entry:.2f}\nSL: {sl:.2f}\nTP: {tp:.2f}\n"
         f"Wolumen: {lots if lots is not None else '?'} lot\n"
-        f"➡️ Wysyłam MARKET do cTrader."
+        f"âĄď¸ WysyĹam MARKET do cTrader."
     )
     ctrader_client.send(req).addErrback(safe_errback)
 
@@ -4104,19 +4090,19 @@ def process_strategy_alert(text):
         return
 
     tf = str(signal.get("timeframe", "?")).lower()
-    if tf not in ("1h", "60", "60m", "h1"):
+    if tf not in ("15", "15m", "15min", "m15"):
         print(f"[TV] REJECTED reason=TIMEFRAME timeframe={tf}", flush=True)
         return
 
     if not getattr(reactor, "running", False):
         print("[TV] REJECTED reason=REACTOR_NOT_RUNNING", flush=True)
         send_telegram_message(
-            "⚠️ cTrader reactor nie działa. Sygnał nie został wykonany."
+            "â ď¸ cTrader reactor nie dziaĹa. SygnaĹ nie zostaĹ wykonany."
         )
         return
 
     print(
-        f"[TV] ACCEPTED {signal.get('symbol')} {signal.get('side')} H1 "
+        f"[TV] ACCEPTED {signal.get('symbol')} {signal.get('side')} {signal.get('timeframe')} "
         "-> SUBMIT TO CTRADER",
         flush=True,
     )
@@ -4151,6 +4137,9 @@ def register_filled_strategy_position(response, instrument):
         "initial_volume_raw": volume_raw,
         "remaining_volume_raw": volume_raw,
         "partial_done": False,
+        "entry_timeframe": last.get("entry_timeframe", "?"),
+        "m15_middle_reached": False,
+        "last_m15_bar_ts": None,
         "best_price": actual_entry,
         "opened_at": int(time.time()),
         "last_managed_at": 0,
@@ -4159,9 +4148,9 @@ def register_filled_strategy_position(response, instrument):
     }
     save_manager_state()
     send_telegram_message(
-        f"✅ {instrument} {side} — POZYCJA OTWARTA\n"
+        f"â {instrument} {side} â POZYCJA OTWARTA\n"
         f"Entry: {actual_entry:.2f}\nSL: {original_sl:.2f}\nTP strategii: {original_tp:.2f}\n"
-        f"➡️ AI Manager przejął prowadzenie pozycji."
+        f"âĄď¸ M15 Tunnel Manager przejÄĹ prowadzenie pozycji."
     )
 
 
@@ -4174,7 +4163,7 @@ def find_live_position(position_id):
 
 def sync_manager_with_reconcile():
     """
-    Synchronize AI Manager state from a FRESH cTrader RECONCILE snapshot.
+    Synchronize M15 Tunnel Manager state from a FRESH cTrader RECONCILE snapshot.
 
     Important:
     - cTrader is the source of truth.
@@ -4212,10 +4201,10 @@ def sync_manager_with_reconcile():
                     flush=True,
                 )
                 send_telegram_message(
-                    f"🔄 {trade.get('instrument', 'US100')} "
-                    f"{trade.get('side', '')} — MANAGER WZNOWIONY\n"
+                    f"đ {trade.get('instrument', 'US100')} "
+                    f"{trade.get('side', '')} â MANAGER WZNOWIONY\n"
                     f"Pozycja {position_id} nadal jest otwarta w cTrader.\n"
-                    f"➡️ AI Manager ponownie ją prowadzi."
+                    f"âĄď¸ M15 Tunnel Manager ponownie jÄ prowadzi."
                 )
 
             trade["reconcile_misses"] = 0
@@ -4249,7 +4238,7 @@ def sync_manager_with_reconcile():
             )
 
             # Require two consecutive fresh reconcile snapshots. This avoids
-            # the race that previously produced false "POZYCJA ZAMKNIĘTA".
+            # the race that previously produced false "POZYCJA ZAMKNIÄTA".
             if misses >= 2 and now - int(trade.get("opened_at") or 0) >= 5:
                 trade["status"] = "CLOSED"
                 print(
@@ -4257,12 +4246,12 @@ def sync_manager_with_reconcile():
                     flush=True,
                 )
                 send_telegram_message(
-                    f"🏁 {trade['instrument']} {trade['side']} — "
-                    f"POZYCJA ZAMKNIĘTA\n"
+                    f"đ {trade['instrument']} {trade['side']} â "
+                    f"POZYCJA ZAMKNIÄTA\n"
                     f"Entry: {float(trade['entry']):.2f}\n"
                     f"Ostatni SL: {float(trade.get('current_sl') or 0):.2f}\n"
                     f"TP strategii: {float(trade.get('strategy_tp') or 0):.2f}\n"
-                    f"✅ Zamknięcie potwierdzone przez 2 kolejne "
+                    f"â ZamkniÄcie potwierdzone przez 2 kolejne "
                     f"odczyty cTrader RECONCILE."
                 )
 
@@ -4309,7 +4298,7 @@ def safe_trailing_price(trade, current_price, r_multiple):
     side = trade["side"]
 
     if side == "LONG":
-        # Po +1R nie cofamy SL poniżej wejścia; po +2R blokujemy minimum +0.75R.
+        # Po +1R nie cofamy SL poniĹźej wejĹcia; po +2R blokujemy minimum +0.75R.
         floor = entry if r_multiple >= 1.0 else original_sl
         if r_multiple >= 2.0:
             floor = max(floor, entry + 0.75 * risk)
@@ -4327,168 +4316,300 @@ def safe_trailing_price(trade, current_price, r_multiple):
         return candidate
 
 
-def manager_ai_decision(trade, current_price, r_multiple, analysis):
-    # AI nie może poszerzać SL ani zwiększać pozycji. Decyzje są dodatkowo ograniczane regułami poniżej.
-    if openai_client is None:
-        return {"action": "HOLD", "reason": "OPENAI_OFF"}
-    compact = {
-        "instrument": trade["instrument"],
-        "side": trade["side"],
-        "entry": trade["entry"],
-        "original_sl": trade["original_sl"],
-        "current_sl": trade["current_sl"],
-        "strategy_tp": trade["strategy_tp"],
-        "current_price": current_price,
-        "r": round(r_multiple, 2),
-        "partial_done": trade.get("partial_done", False),
-        "scores": {
-            "H1_long": analysis.get("H1_long_score"),
-            "H1_short": analysis.get("H1_short_score"),
-            "M15_long": analysis.get("M15_long_score"),
-            "M15_short": analysis.get("M15_short_score"),
-            "M5_long": analysis.get("M5_long_score"),
-            "M5_short": analysis.get("M5_short_score"),
-        },
-    }
-    prompt = (
-        "Zarządzasz JUŻ OTWARTĄ pozycją US100 ze strategii H1 EMA14/HMA14 DAILY. Nie oceniasz ponownie wejścia. "
-        "Strategia startuje ze sztywnym SL 0.40% i TP 0.40%; US100 potrzebuje miejsca na normalne cofnięcia. "
-        "H1 jest nadrzędną tezą. M15 służy WYŁĄCZNIE do zarządzania strukturą/retestem i nigdy samodzielnie nie neguje H1. "
-        "M5 służy do timingu/momentum, M1 pomijamy. Nie wolno poszerzać początkowego SL ani zwiększać pozycji. "
-        "Nie przesuwaj SL wcześnie tylko dlatego, że cena zrobiła zwykły retest EMA14/HMA14. Przed +0.8R preferuj HOLD. "
-        "BE/protect dopiero około +1R i tylko gdy struktura to uzasadnia. Partial zwykle 30% od około +1.5R. "
-        "Przy silnym H1/M15 pozwól pozycji pracować; EXIT przed SL tylko przy rzeczywistym zanegowaniu H1 potwierdzonym przez M15. "
-        "Zwróć WYŁĄCZNIE JSON: {\"action\":\"HOLD|PROTECT|TRAIL|PARTIAL|EXIT\",\"reason\":\"krótko\"}.\n"
-        + json.dumps(compact, ensure_ascii=False)
+def _wma(values, period):
+    if period <= 0 or len(values) < period:
+        return None
+    sample = values[-period:]
+    weights = list(range(1, period + 1))
+    return sum(v * w for v, w in zip(sample, weights)) / float(sum(weights))
+
+
+def hma_latest(values, period=9):
+    if period < 2 or len(values) < period + int(math.sqrt(period)):
+        return None
+    half = max(1, period // 2)
+    root = max(1, int(math.sqrt(period)))
+    synthetic = []
+    for end in range(period, len(values) + 1):
+        window = values[:end]
+        w_full = _wma(window, period)
+        w_half = _wma(window, half)
+        if w_full is not None and w_half is not None:
+            synthetic.append(2.0 * w_half - w_full)
+    return _wma(synthetic, root)
+
+
+def completed_m15_candles(instrument):
+    candles = list(market_state[instrument]["candles"].get("M15", []))
+    if not candles:
+        return []
+
+    # cTrader cache can contain the currently forming M15 candle.
+    # The TradingView strategy fires on candle close, so management uses
+    # completed candles only.
+    now = int(time.time())
+    current_bucket = (now // 900) * 900
+    if int(candles[-1].get("timestamp", 0)) >= current_bucket:
+        candles = candles[:-1]
+    return candles
+
+
+def m15_tunnel_snapshot(instrument):
+    """Calculate the same linear-regression tunnel as the TradingView strategy.
+
+    Pine uses: len=100, source=close, deviation multiplier=2.0.
+    x=bar_index is mathematically equivalent to x=0..n-1 for the regression.
+    """
+    candles = completed_m15_candles(instrument)
+    n = M15_TUNNEL_LENGTH
+    if len(candles) < n:
+        return None
+
+    sample = candles[-n:]
+    closes = [float(c["close"]) for c in sample]
+
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(closes) / n
+    denom = sum((i - x_mean) ** 2 for i in range(n))
+    if denom <= 0:
+        return None
+
+    slope = sum(
+        (i - x_mean) * (closes[i] - y_mean)
+        for i in range(n)
+    ) / denom
+    intercept = y_mean - slope * x_mean
+
+    basis_values = [
+        intercept + slope * i
+        for i in range(n)
+    ]
+    residuals = [
+        closes[i] - basis_values[i]
+        for i in range(n)
+    ]
+    std_dev = math.sqrt(
+        sum(r * r for r in residuals) / n
     )
-    try:
-        response = openai_client.responses.create(
-            model=MANAGER_MODEL,
-            instructions="Odpowiadaj wyłącznie poprawnym JSON bez markdown.",
-            input=prompt,
-        )
-        raw = (response.output_text or "").strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-        if data.get("action") not in ("HOLD", "PROTECT", "TRAIL", "PARTIAL", "EXIT"):
-            return {"action": "HOLD", "reason": "AI_BAD_ACTION"}
-        return data
-    except Exception as error:
-        print("[AI MANAGER ERROR]", error)
-        return {"action": "HOLD", "reason": "AI_ERROR"}
+
+    basis = basis_values[-1]
+    upper = basis + M15_TUNNEL_DEV * std_dev
+    lower = basis - M15_TUNNEL_DEV * std_dev
+    last = sample[-1]
+
+    return {
+        "bar_ts": int(last["timestamp"]),
+        "open": float(last["open"]),
+        "high": float(last["high"]),
+        "low": float(last["low"]),
+        "close": float(last["close"]),
+        "basis": basis,
+        "upper": upper,
+        "lower": lower,
+        "width": upper - lower,
+        "slope": slope,
+        "std_dev": std_dev,
+    }
+
+
+def h1_context(instrument):
+    """H1 is context only; it never creates or cancels an M15 entry by itself."""
+    candles = list(market_state[instrument]["candles"].get("H1", []))
+    if len(candles) < 20:
+        return {"trend": "UNKNOWN", "close": None}
+
+    closes = [float(c["close"]) for c in candles]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50) if len(closes) >= 50 else None
+    close = closes[-1]
+
+    if e50 is not None and close > e20 and e20 > e50:
+        trend = "BULLISH"
+    elif e50 is not None and close < e20 and e20 < e50:
+        trend = "BEARISH"
+    elif close > e20:
+        trend = "BULLISH_WEAK"
+    elif close < e20:
+        trend = "BEARISH_WEAK"
+    else:
+        trend = "NEUTRAL"
+
+    return {
+        "trend": trend,
+        "close": close,
+        "ema20": e20,
+        "ema50": e50,
+    }
 
 
 def manage_one_trade(trade):
     position_id = int(trade["position_id"])
     live = find_live_position(position_id)
     if live is None:
-        # Nie zamykamy managera na podstawie chwilowo pustej/starej listy.
-        # Status CLOSED może ustawić execution event albo dopiero
-        # sync_manager_with_reconcile() po 2 świeżych brakach.
         print(
-            f"[MANAGER] WAIT position_id={position_id} "
-            f"not present in current position cache",
+            f"[MANAGER] WAIT position_id={position_id} not in cache",
             flush=True,
         )
         return
 
     instrument = trade["instrument"]
-    price = latest_market_price(instrument)
-    if price is None:
+    snap = m15_tunnel_snapshot(instrument)
+    if snap is None:
         return
 
+    # Decisions are made once per CLOSED M15 candle. This keeps the manager
+    # synchronized with the TradingView M15 signal and avoids tick noise.
+    if trade.get("last_m15_bar_ts") == snap["bar_ts"]:
+        return
+    trade["last_m15_bar_ts"] = snap["bar_ts"]
+
+    side = trade["side"]
     entry = float(trade["entry"])
     original_sl = float(trade["original_sl"])
+    current_sl = float(trade.get("current_sl") or original_sl)
+    current_price = float(snap["close"])
+    basis = float(snap["basis"])
     risk = abs(entry - original_sl)
     if risk <= 0:
         return
 
-    if trade["side"] == "LONG":
-        trade["best_price"] = max(float(trade.get("best_price", entry)), price)
-        r_multiple = (price - entry) / risk
-    else:
-        trade["best_price"] = min(float(trade.get("best_price", entry)), price)
-        r_multiple = (entry - price) / risk
+    if side == "LONG":
+        r_multiple = (current_price - entry) / risk
+        reached_middle = bool(trade.get("m15_middle_reached"))
+        if snap["high"] >= basis:
+            reached_middle = True
+        trade["m15_middle_reached"] = reached_middle
 
-    analysis = analyse_instrument(instrument)
-    ai = manager_ai_decision(trade, price, r_multiple, analysis)
-    action = ai.get("action", "HOLD")
-    reason = ai.get("reason", "")
-
-    # Główne zabezpieczenie przed zbyt wczesnym BE / partialem.
-    if r_multiple < 0.80 and action in ("PROTECT", "TRAIL", "PARTIAL"):
-        action = "HOLD"
-        reason = "Za wcześnie na zabezpieczenie (<0.8R)"
-    if r_multiple < 1.45 and action == "PARTIAL":
-        action = "HOLD"
-        reason = "Za wcześnie na partial (<1.45R)"
-
-    # EXIT przed SL tylko przy jednoczesnym zanegowaniu H1 i M15.
-    if action == "EXIT" and r_multiple > -0.95:
-        h1_long = analysis.get("H1_long_score", 50) or 50
-        h1_short = analysis.get("H1_short_score", 50) or 50
-        m15_long = analysis.get("M15_long_score", 50) or 50
-        m15_short = analysis.get("M15_short_score", 50) or 50
-        invalid = (
-            trade["side"] == "LONG" and h1_short > h1_long + 12 and m15_short > m15_long + 12
-        ) or (
-            trade["side"] == "SHORT" and h1_long > h1_short + 12 and m15_long > m15_short + 12
-        )
-        if not invalid:
+        # The tunnel basis is the strategy's TP. Once price reaches it,
+        # protect the trade instead of allowing a profitable move to reverse.
+        if reached_middle and current_sl < entry:
+            new_sl = entry
+            if new_sl > current_sl:
+                trade["current_sl"] = new_sl
+                reactor.callFromThread(
+                    amend_position,
+                    position_id,
+                    new_sl,
+                    trade.get("current_tp"),
+                )
+                action = "PROTECT"
+                reason = "LONG: M15 basis reached -> SL to entry"
+            else:
+                action = "HOLD"
+                reason = "LONG: M15 basis reached"
+        else:
             action = "HOLD"
-            reason = "Brak pełnego zanegowania H1+M15"
+            reason = "LONG: M15 tunnel active"
 
-    if action in ("PROTECT", "TRAIL") and r_multiple >= 0.80:
-        new_sl = safe_trailing_price(trade, price, r_multiple)
-        current_sl = float(trade.get("current_sl") or original_sl)
-        improve = new_sl > current_sl if trade["side"] == "LONG" else new_sl < current_sl
-        if improve:
-            trade["current_sl"] = round(new_sl, market_state[instrument].get("digits") or 2)
-            reactor.callFromThread(amend_position, position_id, trade["current_sl"], trade.get("current_tp"))
-            send_telegram_message(
-                f"🛡️ {instrument} {trade['side']} — {action}\n"
-                f"Cena teraz: {price:.2f}\nEntry: {entry:.2f}\n"
-                f"Nowy SL: {trade['current_sl']:.2f}\nCel: {trade['current_tp']:.2f}\n"
-                f"Powód: {reason}"
+        # After +2R, move the SL behind the recent M15 structure.
+        if r_multiple >= 2.0:
+            candidate = safe_trailing_price(
+                trade,
+                current_price,
+                r_multiple,
             )
+            if candidate > current_sl:
+                candidate = round(
+                    candidate,
+                    market_state[instrument].get("digits") or 2,
+                )
+                trade["current_sl"] = candidate
+                reactor.callFromThread(
+                    amend_position,
+                    position_id,
+                    candidate,
+                    trade.get("current_tp"),
+                )
+                action = "TRAIL"
+                reason = "LONG: +2R -> M15 structural trailing"
 
-    elif action == "PARTIAL" and r_multiple >= 1.45 and not trade.get("partial_done"):
-        remaining = int(live.get("volume_raw") or trade.get("remaining_volume_raw") or 0)
-        step = int(market_state[instrument].get("step_volume_raw") or 1)
-        close_raw = int(math.floor((remaining * 0.30) / step) * step)
-        min_raw = int(market_state[instrument].get("min_volume_raw") or step)
-        if close_raw >= min_raw and remaining - close_raw >= min_raw:
-            trade["partial_done"] = True
-            trade["remaining_volume_raw"] = remaining - close_raw
-            new_sl = safe_trailing_price(trade, price, max(r_multiple, 1.5))
-            current_sl = float(trade.get("current_sl") or original_sl)
-            improve = new_sl > current_sl if trade["side"] == "LONG" else new_sl < current_sl
-            if improve:
-                trade["current_sl"] = round(new_sl, market_state[instrument].get("digits") or 2)
-            reactor.callFromThread(close_position_volume, position_id, close_raw)
-            if improve:
-                reactor.callFromThread(amend_position, position_id, trade["current_sl"], trade.get("current_tp"))
-            send_telegram_message(
-                f"📤 {instrument} {trade['side']} — ZLECAM PARTIAL 30%\n"
-                f"Cena zamknięcia części: {price:.2f}\nPozostała pozycja: 70%\n"
-                f"Nowy SL: {trade['current_sl']:.2f}\nCel: {trade['current_tp']:.2f}\n"
-                f"Powód: {reason}"
-            )
+    else:
+        r_multiple = (entry - current_price) / risk
+        reached_middle = bool(trade.get("m15_middle_reached"))
+        if snap["low"] <= basis:
+            reached_middle = True
+        trade["m15_middle_reached"] = reached_middle
 
-    elif action == "EXIT":
-        remaining = int(live.get("volume_raw") or trade.get("remaining_volume_raw") or 0)
-        if remaining > 0:
-            trade["status"] = "CLOSING"
-            reactor.callFromThread(close_position_volume, position_id, remaining)
-            send_telegram_message(
-                f"⛔ {instrument} {trade['side']} — EXIT EARLY\n"
-                f"Cena: {price:.2f}\nEntry: {entry:.2f}\nPowód: {reason}"
+        if reached_middle and current_sl > entry:
+            new_sl = entry
+            if new_sl < current_sl:
+                trade["current_sl"] = new_sl
+                reactor.callFromThread(
+                    amend_position,
+                    position_id,
+                    new_sl,
+                    trade.get("current_tp"),
+                )
+                action = "PROTECT"
+                reason = "SHORT: M15 basis reached -> SL to entry"
+            else:
+                action = "HOLD"
+                reason = "SHORT: M15 basis reached"
+        else:
+            action = "HOLD"
+            reason = "SHORT: M15 tunnel active"
+
+        if r_multiple >= 2.0:
+            candidate = safe_trailing_price(
+                trade,
+                current_price,
+                r_multiple,
             )
+            if candidate < current_sl:
+                candidate = round(
+                    candidate,
+                    market_state[instrument].get("digits") or 2,
+                )
+                trade["current_sl"] = candidate
+                reactor.callFromThread(
+                    amend_position,
+                    position_id,
+                    candidate,
+                    trade.get("current_tp"),
+                )
+                action = "TRAIL"
+                reason = "SHORT: +2R -> M15 structural trailing"
+
+    context = h1_context(instrument)
+
+    if action == "PROTECT":
+        send_telegram_message(
+            f"đĄď¸ {instrument} {side} â M15 PROTECT\n"
+            f"M15 close: {current_price:.2f} | basis: {basis:.2f}\n"
+            f"R: {r_multiple:.2f} | H1: {context['trend']}\n"
+            f"Nowy SL: {float(trade['current_sl']):.2f}"
+        )
+    elif action == "TRAIL":
+        send_telegram_message(
+            f"đ {instrument} {side} â M15 TRAIL\n"
+            f"M15 close: {current_price:.2f} | basis: {basis:.2f}\n"
+            f"R: {r_multiple:.2f} | H1: {context['trend']}\n"
+            f"Nowy SL: {float(trade['current_sl']):.2f}"
+        )
 
     trade["last_managed_at"] = int(time.time())
     manager_state["last_action"][str(position_id)] = {
-        "time": int(time.time()), "price": price, "r": round(r_multiple, 2),
-        "action": action, "reason": reason,
+        "time": int(time.time()),
+        "m15_bar_ts": snap["bar_ts"],
+        "price": current_price,
+        "action": action,
+        "reason": reason,
+        "r_multiple": round(float(r_multiple), 3),
+        "tunnel": {
+            k: round(float(snap[k]), 5)
+            for k in (
+                "basis",
+                "upper",
+                "lower",
+                "width",
+                "slope",
+                "std_dev",
+            )
+        },
+        "middle_reached": bool(
+            trade.get("m15_middle_reached")
+        ),
+        "h1_context": context,
     }
     save_manager_state()
 
@@ -4497,7 +4618,7 @@ def manager_loop():
     while True:
         try:
             if ctrader_state.get("account_authorized"):
-                # Odśwież konto i świece, potem zarządzaj aktywnymi pozycjami.
+                # OdĹwieĹź konto i Ĺwiece, potem zarzÄdzaj aktywnymi pozycjami.
                 if getattr(reactor, "running", False) and ctrader_client is not None:
                     reactor.callFromThread(request_account_data, ctrader_client)
                     reactor.callFromThread(start_market_queue, ctrader_client)
@@ -4558,17 +4679,17 @@ def handle_execution_for_manager(response, instrument):
                 if is_final:
                     trade["status"] = "CLOSED"
                     send_telegram_message(
-                        f"🏁 {trade['instrument']} {trade['side']} — POZYCJA ZAMKNIĘTA\n"
+                        f"đ {trade['instrument']} {trade['side']} â POZYCJA ZAMKNIÄTA\n"
                         f"Entry: {entry:.2f}\nExit: {execution_price:.2f}\n"
-                        f"Ruch na ostatnim zamknięciu: {points:+.2f} pkt\n"
-                        f"Łączny wynik szacunkowy: ${trade['realized_estimate_usd']:+.2f}"
+                        f"Ruch na ostatnim zamkniÄciu: {points:+.2f} pkt\n"
+                        f"ĹÄczny wynik szacunkowy: ${trade['realized_estimate_usd']:+.2f}"
                     )
                 else:
                     remaining_pct = after_remaining / float(trade["initial_volume_raw"]) * 100.0 if trade.get("initial_volume_raw") else 0.0
                     send_telegram_message(
-                        f"💰 {trade['instrument']} {trade['side']} — PARTIAL WYKONANY\n"
+                        f"đ° {trade['instrument']} {trade['side']} â PARTIAL WYKONANY\n"
                         f"Cena wykonania: {execution_price:.2f}\n"
-                        f"Zamknięto: {closed_pct:.0f}%\nPozostało: {remaining_pct:.0f}%\n"
+                        f"ZamkniÄto: {closed_pct:.0f}%\nPozostaĹo: {remaining_pct:.0f}%\n"
                         f"Aktualny SL: {float(trade.get('current_sl') or 0):.2f}\n"
                         f"Cel: {float(trade.get('current_tp') or 0):.2f}"
                     )
@@ -4591,7 +4712,7 @@ def home():
     reset_daily_state_if_needed()
 
     return jsonify({
-        "bot": "FTMO Auto Bot V6.3",
+        "bot": "US100 V8 M15 Tunnel Manager",
         "status": "ONLINE",
 
         "auto_trading_enabled":
@@ -4723,7 +4844,7 @@ def risk_route():
             ),
 
         "daily_stop_percent":
-            OWN_DAILY_STOP_PERCENT,
+            0.0,
 
         "trades_today":
             trade_state[
@@ -4797,15 +4918,13 @@ def auto_on():
         "auto_trading_enabled": True,
 
         "risk_percent":
-            calculate_risk(
-                current_equity()
-            )["risk_percent"],
+            None,
 
         "max_trades_day":
             MAX_TRADES_PER_DAY,
 
         "daily_stop_percent":
-            OWN_DAILY_STOP_PERCENT,
+            0.0,
     })
 
 
@@ -5003,7 +5122,7 @@ def ctrader_status():
         "market_ready": bool(ctrader_state.get("market_ready")),
         "balance": ctrader_state.get("balance"),
         "last_error": ctrader_state.get("last_error"),
-        "route": "LIVE",
+        "route": "DEMO",
         "strategy_only_mode": STRATEGY_ONLY_MODE,
         "fixed_lots_us100": FIXED_LOTS_US100,
     })
@@ -5225,62 +5344,18 @@ def market_refresh():
 @app.route("/analysis")
 def analysis_all():
     return jsonify({
-        "US100":
-            analyse_instrument(
-                "US100"
-            ),
-
-        "XAUUSD":
-            analyse_instrument(
-                "XAUUSD"
-            ),
-
-        "market_ready":
-            ctrader_state[
-                "market_ready"
-            ],
-
-        "auto_trading_enabled":
-            auto_trading_enabled,
-
-        "last_market_refresh":
-            ctrader_state[
-                "last_market_refresh"
-            ],
+        "US100": analyse_instrument("US100"),
+        "market_ready": ctrader_state["market_ready"],
+        "last_market_refresh": ctrader_state["last_market_refresh"],
     })
 
 
 @app.route("/analysis/<instrument>")
 def analysis_single(instrument):
-    key = instrument.upper()
-
-    if key in (
-        "GOLD",
-        "XAU",
-        "XAUUSD",
-    ):
-        key = "XAUUSD"
-
-    elif key in (
-        "US100",
-        "NAS100",
-        "USTEC",
-        "NASDAQ",
-        "NASDAQ100",
-    ):
-        key = "US100"
-
-    if key not in market_state:
-        return jsonify({
-            "status": "error",
-            "message":
-                "Nieznany instrument",
-        }), 404
-
-    return jsonify(
-        analyse_instrument(key)
-    )
-
+    key = detect_instrument(instrument)
+    if key != "US100":
+        return jsonify({"status": "error", "message": "V8 obsluguje tylko US100 / US TECH 100"}), 404
+    return jsonify(analyse_instrument("US100"))
 
 
 # ============================================================
@@ -5327,7 +5402,7 @@ def manager_status():
         "strategy_only_mode": STRATEGY_ONLY_MODE,
         "manager_interval_seconds": MANAGER_INTERVAL_SECONDS,
         "fixed_lots_us100": FIXED_LOTS_US100,
-        "openai_enabled": bool(openai_client),
+        "manager_engine": "M15_LINEAR_REGRESSION_TUNNEL_RULES",
         "telegram_enabled": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
         "active": manager_state.get("active", {}),
         "last_action": manager_state.get("last_action", {}),
@@ -5362,7 +5437,7 @@ def trade_status():
             ),
 
         "daily_stop_percent":
-            OWN_DAILY_STOP_PERCENT,
+            0.0,
 
         "pending_symbols":
             list(
@@ -5392,7 +5467,7 @@ def trade_status():
 # START
 # ============================================================
 
-# IMPORTANT: deploy this build with: python app_v7_strategy_manager.py
+# IMPORTANT: deploy this build with: python app.py
 # The embedded Twisted reactor must stay in the same long-lived process as Flask.
 # Start recovery in a daemon thread at import time.
 threading.Thread(
