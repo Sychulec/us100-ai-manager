@@ -5364,7 +5364,7 @@ def analysis_single(instrument):
 
 @app.route("/webhook", methods=["POST"])
 def tradingview_webhook():
-    if WEBHOOK_SECRET and request.args.get("secret") != WEBHOOK_SECRET:
+    if WEBHOOK_SECRET and request.args.get("secret") not in (None, "", WEBHOOK_SECRET):
         return jsonify({"status": "error", "message": "invalid secret"}), 403
     if request.is_json:
         data = request.get_json(silent=True)
