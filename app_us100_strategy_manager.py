@@ -3917,12 +3917,12 @@ def parse_strategy_alert(text):
     )
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
-    if "WEJSCIE LONG" in normalized:
-        side = "LONG"
-    elif "WEJSCIE SHORT" in normalized:
-        side = "SHORT"
-    else:
-        side = None
+    if "WEJSCIE LONG" in normalized or "ORDER BUY" in normalized:
+    side = "LONG"
+elif "WEJSCIE SHORT" in normalized or "ORDER SELL" in normalized:
+    side = "SHORT"
+else:
+    side = None
 
     symbol_match = re.search(
         r"SYMBOL\s*:\s*([^|]+)",
