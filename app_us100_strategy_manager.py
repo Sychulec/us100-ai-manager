@@ -764,6 +764,10 @@ def submit_strategy_market_order(signal):
     req.volume = int(volume_raw)
 
     # PoczÄtkowy awaryjny SL. Brak relativeTakeProfit.
+    # cTrader wymaga relativeStopLoss zgodnego z dozwoloną precyzją.
+    # Zaokrąglamy dystans SL do 0.01 punktu US100.
+    sl_distance = round(sl_distance, 2)
+
     req.relativeStopLoss = max(
         1,
         int(round(sl_distance * 100000.0))
