@@ -1,41 +1,40 @@
 # -*- coding: utf-8 -*-
 
-# ============================================================
-# US100 V11 DEMO
-#
-# TradingView -> cTrader DEMO -> Telegram
-#
-# Konto DEMO: 5901967
-# Wolumen: 2.00 lot
-# Awaryjny SL: 0.70%
-# Brak sztywnego TP
-#
-# Trade Manager:
-# M15 -> basis -> H1
-#
-# Telegram:
-# - sygnal TradingView
-# - potwierdzenie otwarcia
-# - SL i TP strategii
-# - zmiana SL
-# - przejscie M15 -> H1
-# - analiza regresji
-# - potwierdzenie zamkniecia
-#
-# AI nie steruje transakcjami.
-# Analiza jest algorytmiczna.
-# ============================================================
+"""
+============================================================
+US100 V11 DEMO - SIGNAL OBSERVER
+
+TradingView -> Webhook -> Telegram
+                       -> cTrader DEMO market data
+                       -> Regression analysis -> Telegram
+
+KONTO DEMO: 5901967
+
+ZASADY:
+- NIE otwiera transakcji
+- NIE zamyka transakcji
+- NIE zmienia SL ani TP
+- NIE zmienia strategii TradingView
+- ENTRY / SL / TP zawsze pochodza z alertu
+- Telegram dziala niezaleznie od danych cTrader
+- Analiza rynku jest dodatkowa
+
+WEBHOOK:
+https://us100-ai-manager.onrender.com/webhook?secret=...
+
+============================================================
+"""
 
 import os
 import re
 import time
 import math
-import uuid
 import json
 import tempfile
 import threading
 import unicodedata
 
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 import requests
@@ -58,35 +57,25 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAAccountAuthRes,
     ProtoOAAccountDisconnectEvent,
     ProtoOAAccountsTokenInvalidatedEvent,
-    ProtoOATraderReq,
-    ProtoOATraderRes,
-    ProtoOAReconcileReq,
-    ProtoOAReconcileRes,
     ProtoOASymbolsListReq,
     ProtoOASymbolsListRes,
     ProtoOASymbolByIdReq,
     ProtoOASymbolByIdRes,
     ProtoOAGetTrendbarsReq,
     ProtoOAGetTrendbarsRes,
-    ProtoOAGetPositionUnrealizedPnLReq,
-    ProtoOAGetPositionUnrealizedPnLRes,
-    ProtoOANewOrderReq,
-    ProtoOAExecutionEvent,
-    ProtoOAOrderErrorEvent,
     ProtoOAErrorRes,
-    ProtoOAAmendPositionSLTPReq,
-    ProtoOAClosePositionReq,
 )
 
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
     ProtoOATrendbarPeriod,
-    ProtoOAOrderType,
-    ProtoOATradeSide,
-    ProtoOAExecutionType,
 )
 
 from twisted.internet import reactor
 
+
+# ============================================================
+# FLASK
+# ============================================================
 
 app = Flask(__name__)
 
@@ -95,79 +84,68 @@ app = Flask(__name__)
 # CONFIG
 # ============================================================
 
+BOT_NAME = "US100 V11 DEMO"
+
 TARGET_TRADER_LOGIN = 5901967
 
 FIXED_LOTS_US100 = float(
-    os.environ.get("FIXED_LOTS_US100", "2.00")
+    os.getenv("FIXED_LOTS_US100", "2.00")
 )
-
-BOT_LABEL = "US100_V10_DEMO"
 
 EMERGENCY_SL_PCT = float(
-    os.environ.get("EMERGENCY_SL_PCT", "0.0070")
+    os.getenv("EMERGENCY_SL_PCT", "0.0070")
 )
 
-REG_LENGTH = int(
-    os.environ.get("REG_LENGTH", "100")
+REG_LENGTH = max(
+    5,
+    int(os.getenv("REG_LENGTH", "100"))
 )
 
 REG_DEV = float(
-    os.environ.get("REG_DEV", "2.0")
+    os.getenv("REG_DEV", "2.0")
 )
 
-M15_STRUCTURE_BARS = int(
-    os.environ.get("M15_STRUCTURE_BARS", "4")
+AUTO_REFRESH_SECONDS = max(
+    30,
+    int(os.getenv("AUTO_REFRESH_SECONDS", "60"))
 )
 
-H1_STRUCTURE_BARS = int(
-    os.environ.get("H1_STRUCTURE_BARS", "3")
+# Wersja obserwacyjna.
+# Zadna wartosc zmiennej srodowiskowej nie wlaczy handlu.
+ENABLE_DEMO_TRADING = False
+
+CTRADER_CLIENT_ID = os.getenv(
+    "CTRADER_CLIENT_ID", ""
 )
 
-AUTO_REFRESH_SECONDS = int(
-    os.environ.get("AUTO_REFRESH_SECONDS", "60")
+CTRADER_CLIENT_SECRET = os.getenv(
+    "CTRADER_CLIENT_SECRET", ""
 )
 
-ANALYSIS_INTERVAL_SECONDS = 3600
-
-# Bezpieczny start:
-# 0 = bot nie wysyla zlecen
-# 1 = bot moze handlowac na DEMO
-ENABLE_DEMO_TRADING = (
-    os.environ.get("ENABLE_DEMO_TRADING", "0") == "1"
+CTRADER_REDIRECT_URI = os.getenv(
+    "CTRADER_REDIRECT_URI", ""
 )
 
-CTRADER_CLIENT_ID = os.environ.get(
-    "CTRADER_CLIENT_ID"
-)
-
-CTRADER_CLIENT_SECRET = os.environ.get(
-    "CTRADER_CLIENT_SECRET"
-)
-
-CTRADER_REDIRECT_URI = os.environ.get(
-    "CTRADER_REDIRECT_URI"
-)
-
-TELEGRAM_TOKEN = os.environ.get(
+TELEGRAM_TOKEN = os.getenv(
     "TELEGRAM_TOKEN", ""
 )
 
-TELEGRAM_CHAT_ID = os.environ.get(
+TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID", ""
 )
 
-WEBHOOK_SECRET = os.environ.get(
+WEBHOOK_SECRET = os.getenv(
     "WEBHOOK_SECRET", ""
 )
 
 
 # ============================================================
-# STATE DIRECTORY
+# STATE
 # ============================================================
 
 def choose_state_dir():
 
-    configured = os.environ.get("BOT_STATE_DIR")
+    configured = os.getenv("BOT_STATE_DIR")
 
     candidates = (
         [configured]
@@ -181,10 +159,12 @@ def choose_state_dir():
             continue
 
         try:
+
             os.makedirs(path, exist_ok=True)
 
             probe = os.path.join(
-                path, ".write_test"
+                path,
+                ".write_test"
             )
 
             with open(probe, "w") as f:
@@ -195,23 +175,22 @@ def choose_state_dir():
             return path
 
         except Exception:
-            pass
+            continue
 
     return tempfile.gettempdir()
 
 
 BOT_STATE_DIR = choose_state_dir()
 
-# Zachowujemy stary plik, aby nie utracic tokenow.
+# Zachowujemy zgodnosc z poprzednim plikiem tokenow.
 BOT_STATE_FILE = os.path.join(
     BOT_STATE_DIR,
     "us100_v10_state.json"
 )
 
+state_lock = threading.RLock()
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+market_lock = threading.RLock()
 
 ctrader_state = {
     "access_token": None,
@@ -220,24 +199,10 @@ ctrader_state = {
     "application_authorized": False,
     "account_authorized": False,
     "account_id": None,
-    "balance": None,
-    "equity": None,
-    "unrealized_pnl": 0.0,
-    "positions": [],
-    "orders": [],
     "market_ready": False,
     "last_market_refresh": None,
     "error": None,
 }
-
-trade_state = {
-    "pending_symbols": set(),
-    "last_signal_key": {},
-    "last_order": None,
-    "last_order_error": None,
-}
-
-manager_state = {}
 
 market_state = {
     "US100": {
@@ -245,10 +210,6 @@ market_state = {
         "symbol_id": None,
         "symbol_name": None,
         "digits": None,
-        "min_volume_raw": None,
-        "max_volume_raw": None,
-        "step_volume_raw": None,
-        "lot_size_raw": None,
         "candles": {
             "M15": [],
             "H1": [],
@@ -256,14 +217,20 @@ market_state = {
     }
 }
 
-pending_sl = {}
-pending_close = {}
+observer_state = {
+    "signals_received": 0,
+    "signals_forwarded": 0,
+    "telegram_errors": 0,
+    "last_signal": None,
+    "last_analysis": None,
+    "last_signal_time": None,
+}
 
 ctrader_client = None
-reactor_started = False
-refresh_started = False
 
-state_lock = threading.RLock()
+reactor_started = False
+
+refresh_started = False
 
 
 # ============================================================
@@ -276,14 +243,9 @@ def set_error(error):
 
     print(
         "[ERROR]",
-        error,
-        flush=True,
+        str(error),
+        flush=True
     )
-
-
-def clear_error():
-
-    ctrader_state["error"] = None
 
 
 def safe_errback(failure):
@@ -294,25 +256,17 @@ def safe_errback(failure):
 def fmt_price(value):
 
     if value is None:
-        return "Brak danych"
+        return "BRAK DANYCH"
 
     try:
-        return f"{float(value):,.2f}".replace(",", " ")
+
+        return (
+            f"{float(value):,.2f}"
+            .replace(",", " ")
+        )
 
     except (ValueError, TypeError):
-        return "Brak danych"
-
-
-def fmt_money(value):
-
-    if value is None:
-        return "Brak danych"
-
-    try:
-        return f"{float(value):+,.2f}".replace(",", " ")
-
-    except (ValueError, TypeError):
-        return "Brak danych"
+        return "BRAK DANYCH"
 
 
 def normalize_symbol(name):
@@ -320,7 +274,7 @@ def normalize_symbol(name):
     return re.sub(
         r"[^A-Z0-9]",
         "",
-        str(name or "").upper(),
+        str(name or "").upper()
     )
 
 
@@ -336,7 +290,7 @@ def detect_instrument(name):
         "NASDAQ100",
     )
 
-    if any(x in value for x in aliases):
+    if any(alias in value for alias in aliases):
         return "US100"
 
     return None
@@ -344,14 +298,15 @@ def detect_instrument(name):
 
 def strip_accents(value):
 
-    value = unicodedata.normalize(
+    normalized = unicodedata.normalize(
         "NFKD",
-        str(value),
+        str(value)
     )
 
     return "".join(
-        ch for ch in value
-        if not unicodedata.combining(ch)
+        char
+        for char in normalized
+        if not unicodedata.combining(char)
     )
 
 
@@ -359,163 +314,56 @@ def strip_accents(value):
 # TELEGRAM
 # ============================================================
 
-def send_telegram_message(text):
+def send_telegram_message(message):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 
         print(
-            "[TELEGRAM DISABLED]",
-            text,
-            flush=True,
+            "[TELEGRAM] Brak konfiguracji",
+            flush=True
         )
+
+        observer_state["telegram_errors"] += 1
 
         return False
 
     try:
 
         response = requests.post(
-            f"https://api.telegram.org/bot"
-            f"{TELEGRAM_TOKEN}/sendMessage",
+            (
+                "https://api.telegram.org/bot"
+                f"{TELEGRAM_TOKEN}/sendMessage"
+            ),
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": text,
+                "text": message,
             },
-            timeout=15,
+            timeout=15
         )
 
         response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("ok"):
+
+            observer_state["telegram_errors"] += 1
+
+            return False
 
         return True
 
     except Exception as error:
 
+        observer_state["telegram_errors"] += 1
+
         print(
             "[TELEGRAM ERROR]",
             error,
-            flush=True,
+            flush=True
         )
 
         return False
-
-
-def telegram_signal(signal, emergency_sl, lots):
-
-    side = signal["side"]
-
-    message = (
-        "📥 US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📡 SYGNAŁ TRADINGVIEW\n\n"
-        f"{'🟢' if side == 'LONG' else '🔴'} "
-        f"Kierunek: {side}\n"
-        "📊 Interwał: M15\n\n"
-        f"💰 Cena strategii: "
-        f"{fmt_price(signal['strategy_entry'])}\n"
-        f"🛑 SL strategii: "
-        f"{fmt_price(signal['strategy_sl'])}\n"
-        f"🎯 TP strategii: "
-        f"{fmt_price(signal['strategy_tp'])}\n\n"
-        f"🚨 Awaryjny SL: "
-        f"{fmt_price(emergency_sl)}\n"
-        f"📦 Wolumen: {lots:.2f} lot\n\n"
-        "⏳ Zlecenie wysyłane do cTrader DEMO.\n"
-        "ℹ️ TP jest poziomem informacyjnym."
-    )
-
-    send_telegram_message(message)
-
-
-def telegram_position_opened(position, strategy_tp):
-
-    side = position["side_name"]
-
-    message = (
-        "✅ US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📈 POZYCJA OTWARTA\n\n"
-        f"{'🟢' if side == 'LONG' else '🔴'} "
-        f"{side}\n\n"
-        f"💰 Cena wejścia: "
-        f"{fmt_price(position['price'])}\n"
-        f"📦 Wolumen: "
-        f"{FIXED_LOTS_US100:.2f} lot\n\n"
-        f"🛑 Aktualny SL: "
-        f"{fmt_price(position['stop_loss'])}\n"
-        f"🎯 TP strategii: "
-        f"{fmt_price(strategy_tp)}\n\n"
-        "🤖 MANAGER REGRESJI\n"
-        "📊 Faza: M15\n"
-        "➡️ Po basis M15 przejście na H1.\n\n"
-        "ℹ️ TP nie jest zleceniem w cTrader.\n"
-        f"🆔 Pozycja: {position['position_id']}"
-    )
-
-    send_telegram_message(message)
-
-
-def telegram_sl_changed(
-    side,
-    old_sl,
-    new_sl,
-    reason,
-):
-
-    message = (
-        "🛡️ US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🔄 STOP LOSS ZMIENIONY\n\n"
-        f"📈 Kierunek: {side}\n\n"
-        f"🔴 Poprzedni SL: "
-        f"{fmt_price(old_sl)}\n"
-        f"🟢 Nowy SL: "
-        f"{fmt_price(new_sl)}\n\n"
-        f"📊 Powód:\n{reason}\n\n"
-        "✅ Zmiana potwierdzona przez cTrader."
-    )
-
-    send_telegram_message(message)
-
-
-def telegram_basis_reached(side, basis, sl):
-
-    message = (
-        "🤖 US100 V11 MANAGER\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 ZMIANA FAZY\n\n"
-        f"📈 Kierunek: {side}\n"
-        "✅ Basis M15 osiągnięty\n\n"
-        f"🎯 Basis: {fmt_price(basis)}\n"
-        f"🛑 Ostatni znany SL: "
-        f"{fmt_price(sl)}\n\n"
-        "➡️ H1 PRZEJMUJE PROWADZENIE\n\n"
-        "Manager obserwuje zamknięcia H1 "
-        "i przesuwa SL po strukturze."
-    )
-
-    send_telegram_message(message)
-
-
-def telegram_position_closed(
-    side,
-    entry,
-    close_price,
-    pnl,
-    reason,
-):
-
-    message = (
-        "🏁 US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🔴 POZYCJA ZAMKNIĘTA\n\n"
-        f"📈 Kierunek: {side}\n"
-        f"💰 Wejście: {fmt_price(entry)}\n"
-        f"💵 Zamknięcie: {fmt_price(close_price)}\n"
-        f"💰 Wynik: {fmt_money(pnl)}\n\n"
-        f"📋 Powód: {reason}\n\n"
-        "✅ Zamknięcie potwierdzone."
-    )
-
-    send_telegram_message(message)
 
 
 # ============================================================
@@ -527,47 +375,47 @@ def save_state():
     payload = {
         "access_token": ctrader_state["access_token"],
         "refresh_token": ctrader_state["refresh_token"],
-        "last_signal_key": trade_state["last_signal_key"],
-        "manager_state": manager_state,
+        "observer_state": observer_state,
     }
-
-    temp = BOT_STATE_FILE + ".tmp"
 
     try:
 
         with state_lock:
 
+            temporary = BOT_STATE_FILE + ".tmp"
+
             with open(
-                temp,
+                temporary,
                 "w",
-                encoding="utf-8",
+                encoding="utf-8"
             ) as handle:
 
                 json.dump(
                     payload,
                     handle,
                     ensure_ascii=False,
-                    indent=2,
+                    indent=2
                 )
 
             os.replace(
-                temp,
-                BOT_STATE_FILE,
+                temporary,
+                BOT_STATE_FILE
             )
 
         return True
 
     except Exception as error:
 
-        set_error(error)
+        print(
+            "[STATE ERROR]",
+            error,
+            flush=True
+        )
 
         return False
 
 
 def load_state():
-
-    if not os.path.exists(BOT_STATE_FILE):
-        return False
 
     try:
 
@@ -575,8 +423,7 @@ def load_state():
 
             with open(
                 BOT_STATE_FILE,
-                "r",
-                encoding="utf-8",
+                encoding="utf-8"
             ) as handle:
 
                 payload = json.load(handle)
@@ -589,21 +436,29 @@ def load_state():
             "refresh_token"
         )
 
-        trade_state["last_signal_key"] = dict(
-            payload.get("last_signal_key") or {}
+        saved_observer = payload.get(
+            "observer_state"
         )
 
-        manager_state.clear()
+        if isinstance(saved_observer, dict):
 
-        manager_state.update(
-            payload.get("manager_state") or {}
-        )
+            observer_state.update(
+                saved_observer
+            )
 
         return True
 
+    except FileNotFoundError:
+
+        return False
+
     except Exception as error:
 
-        set_error(error)
+        print(
+            "[STATE LOAD ERROR]",
+            error,
+            flush=True
+        )
 
         return False
 
@@ -615,17 +470,23 @@ def load_state():
 def extract_number(label, text):
 
     match = re.search(
-        rf"{label}\s*:\s*(-?[0-9]+(?:[.,][0-9]+)?)",
+        rf"\b{re.escape(label)}\s*:\s*"
+        r"(-?[0-9]+(?:[.,][0-9]+)?)",
         text,
-        re.I,
+        re.I
     )
 
     if not match:
         return None
 
-    return float(
-        match.group(1).replace(",", ".")
-    )
+    try:
+
+        return float(
+            match.group(1).replace(",", ".")
+        )
+
+    except ValueError:
+        return None
 
 
 def parse_strategy_alert(text):
@@ -635,38 +496,41 @@ def parse_strategy_alert(text):
     normalized = re.sub(
         r"\s+",
         " ",
-        strip_accents(raw).upper(),
+        strip_accents(raw).upper()
     ).strip()
 
     if "WEJSCIE LONG" in normalized:
+
         side = "LONG"
 
     elif "WEJSCIE SHORT" in normalized:
+
         side = "SHORT"
 
     else:
+
         side = None
 
     symbol_match = re.search(
-        r"SYMBOL\s*:\s*([^|]+)",
-        normalized,
-        re.I,
+        r"\bSYMBOL\s*:\s*([^|]+)",
+        normalized
     )
 
-    tf_match = re.search(
-        r"TF\s*:\s*([^|]+)",
-        normalized,
-        re.I,
+    timeframe_match = re.search(
+        r"\bTF\s*:\s*([^|]+)",
+        normalized
     )
 
     symbol_raw = (
         symbol_match.group(1).strip()
-        if symbol_match else ""
+        if symbol_match
+        else ""
     )
 
     timeframe = (
-        tf_match.group(1).strip().lower()
-        if tf_match else "?"
+        timeframe_match.group(1).strip().lower()
+        if timeframe_match
+        else "?"
     )
 
     return {
@@ -675,844 +539,92 @@ def parse_strategy_alert(text):
         "symbol": detect_instrument(symbol_raw),
         "timeframe": timeframe,
         "strategy_entry": extract_number(
-            "CENA", normalized
+            "CENA",
+            normalized
         ),
         "strategy_sl": extract_number(
-            "SL", normalized
+            "SL",
+            normalized
         ),
         "strategy_tp": extract_number(
-            "TP", normalized
+            "TP",
+            normalized
         ),
         "raw": raw,
     }
 
 
 # ============================================================
-# VOLUME
+# SIGNAL VALIDATION
 # ============================================================
 
-def fixed_volume_for_lots(lots):
+def validate_signal(signal):
 
-    data = market_state["US100"]
+    if signal["event"] != "ENTRY":
 
-    lot_size = int(
-        data.get("lot_size_raw") or 0
-    )
+        return False, "Nieznany typ alertu"
 
-    minimum = int(
-        data.get("min_volume_raw") or 0
-    )
+    if signal["side"] not in ("LONG", "SHORT"):
 
-    maximum = int(
-        data.get("max_volume_raw") or 0
-    )
+        return False, "Brak kierunku"
 
-    step = int(
-        data.get("step_volume_raw") or 0
-    )
+    if signal["symbol"] != "US100":
 
-    if min(
-        lot_size,
-        minimum,
-        maximum,
-        step,
-    ) <= 0:
-        return None
+        return False, "Inny instrument"
 
-    raw = int(
-        round(float(lots) * lot_size)
-    )
-
-    if raw % step != 0:
-        return None
-
-    if not minimum <= raw <= maximum:
-        return None
-
-    return raw
-
-
-def open_position_symbol_ids():
-
-    return {
-        int(p["symbol_id"])
-        for p in ctrader_state["positions"]
-    }
-
-
-# ============================================================
-# REGRESSION CHANNEL
-# ============================================================
-
-def closed_candles(timeframe):
-
-    candles = list(
-        market_state["US100"]["candles"].get(
-            timeframe, []
-        )
-    )
-
-    now = int(time.time())
-
-    seconds = (
-        900 if timeframe == "M15"
-        else 3600
-    )
-
-    return [
-        c for c in candles
-        if int(c["timestamp"]) + seconds <= now
-    ]
-
-
-def regression_channel(candles):
-
-    if len(candles) < REG_LENGTH:
-        return None
-
-    window = candles[-REG_LENGTH:]
-
-    y = [
-        float(c["close"])
-        for c in window
-    ]
-
-    n = len(y)
-
-    mean_x = (n - 1) / 2.0
-    mean_y = sum(y) / n
-
-    var_x = sum(
-        (i - mean_x) ** 2
-        for i in range(n)
-    )
-
-    if var_x <= 0:
-        return None
-
-    cov = sum(
-        (i - mean_x) * (y[i] - mean_y)
-        for i in range(n)
-    )
-
-    slope = cov / var_x
-
-    intercept = (
-        mean_y - slope * mean_x
-    )
-
-    fitted = [
-        intercept + slope * i
-        for i in range(n)
-    ]
-
-    residuals = [
-        y[i] - fitted[i]
-        for i in range(n)
-    ]
-
-    stdev = math.sqrt(
-        sum(r * r for r in residuals) / n
-    )
-
-    basis = fitted[-1]
-
-    return {
-        "basis": basis,
-        "upper": basis + REG_DEV * stdev,
-        "lower": basis - REG_DEV * stdev,
-        "slope": slope,
-        "stdev": stdev,
-        "bar_ts": int(
-            window[-1]["timestamp"]
-        ),
-    }
-
-
-def structure_stop(side, candles, bars):
-
-    if len(candles) < bars:
-        return None
-
-    recent = candles[-bars:]
-
-    if side == "LONG":
-
-        return min(
-            float(c["low"])
-            for c in recent
-        )
-
-    return max(
-        float(c["high"])
-        for c in recent
-    )
-
-
-def is_tighter_sl(side, current, candidate):
-
-    if candidate is None or candidate <= 0:
-        return False
-
-    if not current or current <= 0:
-        return True
-
-    if side == "LONG":
-        return candidate > current
-
-    return candidate < current
-
-
-# ============================================================
-# TELEGRAM ANALYSIS
-# ============================================================
-
-def send_position_analysis(position, state):
-
-    m15 = closed_candles("M15")
-    h1 = closed_candles("H1")
-
-    m15_reg = regression_channel(m15)
-    h1_reg = regression_channel(h1)
-
-    if not m15_reg or not h1_reg:
-        return
-
-    # Ostatnia zamknieta swieca M15.
-    # To nie jest aktualny tick Bid/Ask.
-    price = float(m15[-1]["close"])
-
-    side = state["side"]
-
-    m15_basis = m15_reg["basis"]
-    h1_basis = h1_reg["basis"]
-
-    m15_position = (
-        "POWYŻEJ"
-        if price >= m15_basis
-        else "PONIŻEJ"
-    )
-
-    h1_position = (
-        "POWYŻEJ"
-        if price >= h1_basis
-        else "PONIŻEJ"
-    )
-
-    slope = h1_reg["slope"]
-
-    if slope > 0:
-        trend = "WZROSTOWY 📈"
-
-    elif slope < 0:
-        trend = "SPADKOWY 📉"
-
-    else:
-        trend = "BOCZNY ➡️"
-
-    if (
-        side == "LONG"
-        and slope > 0
-        and price >= h1_basis
-    ):
-        conclusion = (
-            "Trend H1 wspiera LONG. "
-            "Cena utrzymuje się nad basis."
-        )
-
-    elif (
-        side == "SHORT"
-        and slope < 0
-        and price <= h1_basis
-    ):
-        conclusion = (
-            "Trend H1 wspiera SHORT. "
-            "Cena utrzymuje się pod basis."
-        )
-
-    else:
-        conclusion = (
-            "Uwaga: pozycja nie ma pełnego "
-            "potwierdzenia z tunelu H1."
-        )
-
-    message = (
-        "🧠 US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "📊 ANALIZA POZYCJI\n\n"
-        f"📈 Kierunek: {side}\n"
-        f"💰 Wejście: "
-        f"{fmt_price(state['entry'])}\n"
-        f"💵 Ostatnie zamknięcie M15: "
-        f"{fmt_price(price)}\n\n"
-        f"🛑 Aktualny SL: "
-        f"{fmt_price(position['stop_loss'])}\n"
-        f"🎯 TP strategii: "
-        f"{fmt_price(state.get('tv_tp_reference'))}\n\n"
-        "📊 TUNEL REGRESJI\n\n"
-        f"🔹 M15: {m15_position} basis\n"
-        f"🔹 H1: {h1_position} basis\n"
-        f"📈 Trend H1: {trend}\n"
-        f"⚙️ Faza managera: {state['phase']}\n\n"
-        f"🤖 OCENA:\n{conclusion}\n\n"
-        "ℹ️ Analiza informacyjna. "
-        "Nie zmienia zasad managera."
-    )
-
-    send_telegram_message(message)
-
-
-# ============================================================
-# POSITION CONTROL
-# ============================================================
-
-def amend_position_sl(position_id, new_sl, reason):
-
-    if not ENABLE_DEMO_TRADING:
-        return False
-
-    if not ctrader_state["account_authorized"]:
-        return False
-
-    pid = str(position_id)
-
-    if pid in pending_sl:
-        return False
-
-    position = next(
-        (
-            p for p in ctrader_state["positions"]
-            if str(p["position_id"]) == pid
-        ),
-        None,
-    )
-
-    if position is None:
-        return False
-
-    old_sl = float(
-        position.get("stop_loss") or 0
-    )
-
-    digits = (
-        market_state["US100"]["digits"] or 2
-    )
-
-    new_sl = round(
-        float(new_sl),
-        digits,
-    )
-
-    side = position["side_name"]
-
-    if not is_tighter_sl(
-        side,
-        old_sl,
-        new_sl,
-    ):
-        return False
-
-    req = ProtoOAAmendPositionSLTPReq()
-
-    req.ctidTraderAccountId = int(
-        ctrader_state["account_id"]
-    )
-
-    req.positionId = int(position_id)
-    req.stopLoss = new_sl
-
-    # Nie dodajemy ani nie zmieniamy TP.
-    pending_sl[pid] = {
-        "old": old_sl,
-        "new": new_sl,
-        "reason": reason,
-        "side": side,
-        "requested_at": time.time(),
-    }
-
-    print(
-        "[SL REQUEST]",
-        pid,
-        old_sl,
-        new_sl,
-        flush=True,
-    )
-
-    def errback(failure):
-
-        pending_sl.pop(pid, None)
-
-        set_error(
-            f"SL ERROR {pid}: {failure}"
-        )
-
-    ctrader_client.send(req).addErrback(
-        errback
-    )
-
-    return True
-
-
-def close_position(position_id, volume_raw, reason):
-
-    if not ENABLE_DEMO_TRADING:
-        return False
-
-    if not ctrader_state["account_authorized"]:
-        return False
-
-    pid = str(position_id)
-
-    if pid in pending_close:
-        return False
-
-    req = ProtoOAClosePositionReq()
-
-    req.ctidTraderAccountId = int(
-        ctrader_state["account_id"]
-    )
-
-    req.positionId = int(position_id)
-    req.volume = int(volume_raw)
-
-    pending_close[pid] = {
-        "reason": reason,
-        "requested_at": time.time(),
-    }
-
-    state = manager_state.get(pid)
-
-    if state:
-        state["close_requested"] = True
-
-    def errback(failure):
-
-        pending_close.pop(pid, None)
-
-        if state:
-            state["close_requested"] = False
-
-        set_error(
-            f"CLOSE ERROR {pid}: {failure}"
-        )
-
-    ctrader_client.send(req).addErrback(
-        errback
-    )
-
-    send_telegram_message(
-        "⏳ US100 V11 DEMO\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "🔴 Manager wysłał zlecenie zamknięcia.\n"
-        f"📋 Powód: {reason}\n\n"
-        "Oczekiwanie na potwierdzenie cTrader."
-    )
-
-    return True
-
-
-# ============================================================
-# MANAGER
-# ============================================================
-
-def ensure_manager_for_position(position):
-
-    pid = str(position["position_id"])
-
-    if pid in manager_state:
-        return manager_state[pid]
-
-    label = position.get("label") or ""
-
-    last = trade_state.get("last_order") or {}
-
-    last_pid = last.get("position_id")
-
-    belongs = (
-        label == BOT_LABEL
-        or (
-            last_pid is not None
-            and int(last_pid) == int(pid)
-        )
-    )
-
-    if not belongs:
-        return None
-
-    entry = float(
-        position.get("price")
-        or last.get("actual_entry")
-        or last.get("entry")
-        or 0
-    )
-
-    if entry <= 0:
-        return None
-
-    state = {
-        "position_id": int(pid),
-        "side": position["side_name"],
-        "entry": entry,
-        "tv_tp_reference": last.get(
-            "strategy_tp"
-        ),
-        "phase": "M15",
-        "basis_reached": False,
-        "last_h1_bar": None,
-        "last_analysis_at": 0,
-        "close_requested": False,
-        "opened_notified": False,
-        "created_at": int(time.time()),
-    }
-
-    manager_state[pid] = state
-
-    save_state()
-
-    return state
-
-
-def manage_position(position):
-
-    state = ensure_manager_for_position(position)
-
-    if not state:
-        return
-
-    pid = str(position["position_id"])
-
-    if not state.get("opened_notified"):
-
-        # Powiadomienie dopiero po pojawieniu sie
-        # pozycji w danych cTrader.
-        state["opened_notified"] = True
-
-        telegram_position_opened(
-            position,
-            state.get("tv_tp_reference"),
-        )
-
-        save_state()
-
-    if state.get("close_requested"):
-        return
-
-    side = state["side"]
-
-    current_sl = float(
-        position.get("stop_loss") or 0
-    )
-
-    m15 = closed_candles("M15")
-    h1 = closed_candles("H1")
-
-    if len(m15) < REG_LENGTH:
-        return
-
-    m15_reg = regression_channel(m15)
-
-    if not m15_reg:
-        return
-
-    last_m15 = m15[-1]
-
-    m15_ts = int(
-        last_m15["timestamp"]
-    )
-
-    # =========================================
-    # FAZA M15
-    # =========================================
-
-    if not state.get("basis_reached"):
-
-        if side == "LONG":
-
-            reached = (
-                float(last_m15["high"])
-                >= m15_reg["basis"]
-            )
-
-        else:
-
-            reached = (
-                float(last_m15["low"])
-                <= m15_reg["basis"]
-            )
-
-        if reached:
-
-            state["basis_reached"] = True
-            state["phase"] = "H1"
-
-            candidate = structure_stop(
-                side,
-                m15,
-                M15_STRUCTURE_BARS,
-            )
-
-            if candidate is not None:
-
-                close_price = float(
-                    last_m15["close"]
-                )
-
-                valid = (
-                    candidate < close_price
-                    if side == "LONG"
-                    else candidate > close_price
-                )
-
-                if (
-                    valid
-                    and is_tighter_sl(
-                        side,
-                        current_sl,
-                        candidate,
-                    )
-                ):
-
-                    amend_position_sl(
-                        position["position_id"],
-                        candidate,
-                        "M15 basis osiągnięty - "
-                        "SL po strukturze M15",
-                    )
-
-            telegram_basis_reached(
-                side,
-                m15_reg["basis"],
-                current_sl,
-            )
-
-            save_state()
-
-    # =========================================
-    # ANALIZA CO GODZINE
-    # =========================================
-
-    now = time.time()
-
-    if (
-        now - state.get("last_analysis_at", 0)
-        >= ANALYSIS_INTERVAL_SECONDS
+    if signal["timeframe"] not in (
+        "15",
+        "15m",
+        "15min",
+        "m15"
     ):
 
-        if regression_channel(h1):
+        return False, "Inny interwal"
 
-            send_position_analysis(
-                position,
-                state,
-            )
-
-            state["last_analysis_at"] = now
-
-            save_state()
-
-    # =========================================
-    # FAZA H1
-    # =========================================
-
-    if state["phase"] != "H1":
-        return
-
-    if len(h1) < REG_LENGTH:
-        return
-
-    h1_reg = regression_channel(h1)
-
-    if not h1_reg:
-        return
-
-    last_h1 = h1[-1]
-
-    h1_ts = int(
-        last_h1["timestamp"]
-    )
-
-    if state.get("last_h1_bar") == h1_ts:
-        return
-
-    state["last_h1_bar"] = h1_ts
-
-    h1_close = float(
-        last_h1["close"]
-    )
-
-    invalidated = (
-        h1_close < h1_reg["basis"]
-        if side == "LONG"
-        else h1_close > h1_reg["basis"]
-    )
-
-    if invalidated:
-
-        close_position(
-            position["position_id"],
-            position["volume_raw"],
-            "H1 zamknęła się po złej stronie "
-            f"basis {fmt_price(h1_reg['basis'])}",
-        )
-
-        save_state()
-
-        return
-
-    candidate = structure_stop(
-        side,
-        h1,
-        H1_STRUCTURE_BARS,
-    )
-
-    if candidate is not None:
-
-        valid = (
-            candidate < h1_close
-            if side == "LONG"
-            else candidate > h1_close
-        )
-
-        if (
-            valid
-            and is_tighter_sl(
-                side,
-                current_sl,
-                candidate,
-            )
-        ):
-
-            amend_position_sl(
-                position["position_id"],
-                candidate,
-                "H1 utrzymuje kierunek - "
-                "SL po strukturze H1",
-            )
-
-    save_state()
-
-
-def run_trade_manager():
-
-    if not ctrader_state["account_authorized"]:
-        return
-
-    if not ctrader_state["market_ready"]:
-        return
-
-    symbol_id = market_state["US100"]["symbol_id"]
-
-    if not symbol_id:
-        return
-
-    open_ids = set()
-
-    for position in list(
-        ctrader_state["positions"]
+    for key in (
+        "strategy_entry",
+        "strategy_sl",
+        "strategy_tp"
     ):
 
-        if int(position["symbol_id"]) != int(
-            symbol_id
-        ):
-            continue
+        value = signal[key]
 
-        pid = str(
-            position["position_id"]
-        )
+        if value is None:
 
-        open_ids.add(pid)
+            return False, f"Brak {key}"
 
-        manage_position(position)
+        if not math.isfinite(value):
 
-    # Nie usuwamy od razu stanu przy zamknieciu.
-    # Pozwala to zachowac dane do potwierdzenia
-    # i powiadomienia o zamknieciu.
+            return False, f"Niepoprawne {key}"
+
+        if value <= 0:
+
+            return False, f"Niepoprawna cena {key}"
+
+    return True, "OK"
 
 
 # ============================================================
-# SEND ORDER
+# TELEGRAM SIGNAL
 # ============================================================
 
-def submit_strategy_market_order(signal):
+def telegram_strategy_signal(signal):
 
-    if not ENABLE_DEMO_TRADING:
-
-        print(
-            "[TV] DEMO TRADING DISABLED",
-            flush=True,
-        )
-
-        send_telegram_message(
-            "🔒 US100 V11 DEMO\n"
-            "Sygnał odebrany, ale automatyczne "
-            "zlecenia są wyłączone."
-        )
-
-        return
-
-    if (
-        ctrader_client is None
-        or not ctrader_state["account_authorized"]
-    ):
-        return
-
-    if "US100" in trade_state["pending_symbols"]:
-        return
-
-    symbol_id = market_state["US100"]["symbol_id"]
-
-    if not symbol_id:
-        return
-
-    if int(symbol_id) in open_position_symbol_ids():
-        return
+    side = signal["side"]
 
     entry = signal["strategy_entry"]
+
     strategy_sl = signal["strategy_sl"]
+
     strategy_tp = signal["strategy_tp"]
 
-    if signal["side"] == "LONG":
-
-        if not strategy_sl < entry < strategy_tp:
-            return
-
-    else:
-
-        if not strategy_tp < entry < strategy_sl:
-            return
-
-    signal_key = (
-        f"{signal['side']}:"
-        f"{signal['timeframe']}:"
-        f"{entry:.5f}:"
-        f"{strategy_sl:.5f}:"
-        f"{strategy_tp:.5f}"
-    )
-
-    if (
-        trade_state["last_signal_key"].get("US100")
-        == signal_key
-    ):
-        return
-
-    volume_raw = fixed_volume_for_lots(
-        FIXED_LOTS_US100
-    )
-
-    if volume_raw is None:
-
-        send_telegram_message(
-            "⚠️ US100 V11 DEMO\n"
-            "Nie mogę ustawić dokładnie "
-            f"{FIXED_LOTS_US100:.2f} lot."
-        )
-
-        return
-
-    if signal["side"] == "LONG":
+    if side == "LONG":
 
         emergency_sl = (
             entry * (1 - EMERGENCY_SL_PCT)
         )
+
+        direction_icon = "🟢"
 
     else:
 
@@ -1520,144 +632,46 @@ def submit_strategy_market_order(signal):
             entry * (1 + EMERGENCY_SL_PCT)
         )
 
-    sl_distance = round(
-        abs(entry - emergency_sl),
-        2,
+        direction_icon = "🔴"
+
+    message = (
+        "📥 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📡 SYGNAŁ TRADINGVIEW\n\n"
+
+        f"{direction_icon} KIERUNEK: {side}\n"
+        "📊 INTERWAŁ: M15\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📍 POZIOMY STRATEGII\n\n"
+
+        f"💰 ENTRY: {fmt_price(entry)}\n"
+        f"🛑 SL: {fmt_price(strategy_sl)}\n"
+        f"🎯 TP: {fmt_price(strategy_tp)}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚙️ PARAMETRY DEMO\n\n"
+
+        f"📦 Wolumen planowany: "
+        f"{FIXED_LOTS_US100:.2f} lot\n"
+
+        f"🚨 Awaryjny SL referencyjny: "
+        f"{fmt_price(emergency_sl)}\n\n"
+
+        "🤖 MANAGER: M15 → H1\n"
+        "🔒 HANDEL AUTOMATYCZNY: OFF\n\n"
+
+        "ℹ️ To sygnał strategii, "
+        "nie potwierdzenie otwarcia pozycji.\n"
+
+        "🧠 Analiza rynku w osobnej wiadomości."
     )
 
-    req = ProtoOANewOrderReq()
-
-    req.ctidTraderAccountId = int(
-        ctrader_state["account_id"]
-    )
-
-    req.symbolId = int(symbol_id)
-
-    req.orderType = ProtoOAOrderType.MARKET
-
-    req.tradeSide = (
-        ProtoOATradeSide.BUY
-        if signal["side"] == "LONG"
-        else ProtoOATradeSide.SELL
-    )
-
-    req.volume = int(volume_raw)
-
-    req.relativeStopLoss = max(
-        1,
-        int(round(sl_distance * 100000.0)),
-    )
-
-    # Bez relativeTakeProfit.
-    req.label = BOT_LABEL
-
-    req.comment = (
-        f"US100 V11 M15 {signal['side']} "
-        f"{FIXED_LOTS_US100:.2f} lot"
-    )[:512]
-
-    req.clientOrderId = (
-        f"V11-{int(time.time())}-"
-        f"{uuid.uuid4().hex[:8]}"
-    )[:50]
-
-    trade_state["pending_symbols"].add(
-        "US100"
-    )
-
-    trade_state["last_signal_key"][
-        "US100"
-    ] = signal_key
-
-    trade_state["last_order"] = {
-        "side": signal["side"],
-        "entry": entry,
-        "strategy_sl": strategy_sl,
-        "strategy_tp": strategy_tp,
-        "emergency_sl": emergency_sl,
-        "lots": FIXED_LOTS_US100,
-        "volume_raw": volume_raw,
-        "status": "SENT",
-        "sent_at": int(time.time()),
-    }
-
-    save_state()
-
-    telegram_signal(
-        signal,
-        emergency_sl,
-        FIXED_LOTS_US100,
-    )
-
-    def errback(failure):
-
-        trade_state["pending_symbols"].discard(
-            "US100"
-        )
-
-        trade_state["last_order_error"] = str(
-            failure
-        )
-
-        set_error(failure)
-
-    ctrader_client.send(req).addErrback(
-        errback
-    )
+    return send_telegram_message(message)
 
 
 # ============================================================
-# PROCESS ALERT
-# ============================================================
-
-def process_strategy_alert(text):
-
-    signal = parse_strategy_alert(text)
-
-    print(
-        "[TV]",
-        signal,
-        flush=True,
-    )
-
-    if signal["event"] != "ENTRY":
-        return
-
-    if signal["side"] not in (
-        "LONG",
-        "SHORT",
-    ):
-        return
-
-    if signal["symbol"] != "US100":
-        return
-
-    if signal["timeframe"] not in (
-        "15",
-        "15m",
-        "15min",
-        "m15",
-    ):
-        return
-
-    if None in (
-        signal["strategy_entry"],
-        signal["strategy_sl"],
-        signal["strategy_tp"],
-    ):
-        return
-
-    if not reactor.running:
-        return
-
-    reactor.callFromThread(
-        submit_strategy_market_order,
-        signal,
-    )
-
-
-# ============================================================
-# TREND BARS
+# REGRESSION
 # ============================================================
 
 def trendbar_to_dict(bar, digits):
@@ -1670,23 +684,385 @@ def trendbar_to_dict(bar, digits):
         ),
         "open": round(
             (low + int(bar.deltaOpen)) / 100000.0,
-            digits,
+            digits
         ),
         "high": round(
             (low + int(bar.deltaHigh)) / 100000.0,
-            digits,
+            digits
         ),
         "low": round(
             low / 100000.0,
-            digits,
+            digits
         ),
         "close": round(
             (low + int(bar.deltaClose)) / 100000.0,
-            digits,
+            digits
         ),
         "volume": int(bar.volume),
     }
 
+
+def closed_candles(timeframe):
+
+    with market_lock:
+
+        candles = list(
+            market_state["US100"]["candles"].get(
+                timeframe,
+                []
+            )
+        )
+
+    now = int(time.time())
+
+    seconds = (
+        900
+        if timeframe == "M15"
+        else 3600
+    )
+
+    return [
+        candle
+        for candle in candles
+        if candle["timestamp"] + seconds <= now
+    ]
+
+
+def regression_channel(candles):
+
+    if len(candles) < REG_LENGTH:
+
+        return None
+
+    window = candles[-REG_LENGTH:]
+
+    prices = [
+        float(candle["close"])
+        for candle in window
+    ]
+
+    count = len(prices)
+
+    mean_x = (count - 1) / 2.0
+
+    mean_y = sum(prices) / count
+
+    variance_x = sum(
+        (index - mean_x) ** 2
+        for index in range(count)
+    )
+
+    if variance_x <= 0:
+
+        return None
+
+    covariance = sum(
+        (index - mean_x) * (prices[index] - mean_y)
+        for index in range(count)
+    )
+
+    slope = covariance / variance_x
+
+    intercept = mean_y - slope * mean_x
+
+    fitted = [
+        intercept + slope * index
+        for index in range(count)
+    ]
+
+    residuals = [
+        prices[index] - fitted[index]
+        for index in range(count)
+    ]
+
+    stdev = math.sqrt(
+        sum(value * value for value in residuals)
+        / count
+    )
+
+    basis = fitted[-1]
+
+    return {
+        "basis": basis,
+        "upper": basis + REG_DEV * stdev,
+        "lower": basis - REG_DEV * stdev,
+        "slope": slope,
+        "stdev": stdev,
+        "bar_ts": window[-1]["timestamp"],
+    }
+
+
+# ============================================================
+# MARKET ANALYSIS
+# ============================================================
+
+def analyse_market(signal):
+
+    m15 = closed_candles("M15")
+
+    h1 = closed_candles("H1")
+
+    m15_reg = regression_channel(m15)
+
+    h1_reg = regression_channel(h1)
+
+    if not m15_reg or not h1_reg:
+
+        return {
+            "status": "WAITING",
+            "reason": (
+                "Dane M15/H1 nie sa jeszcze gotowe."
+            )
+        }
+
+    price = float(m15[-1]["close"])
+
+    m15_basis = m15_reg["basis"]
+
+    h1_basis = h1_reg["basis"]
+
+    h1_slope = h1_reg["slope"]
+
+    side = signal["side"]
+
+    if h1_slope > 0:
+
+        trend = "WZROSTOWY"
+
+    elif h1_slope < 0:
+
+        trend = "SPADKOWY"
+
+    else:
+
+        trend = "BOCZNY"
+
+    if side == "LONG":
+
+        alignment = (
+            h1_slope > 0
+            and price >= h1_basis
+        )
+
+    else:
+
+        alignment = (
+            h1_slope < 0
+            and price <= h1_basis
+        )
+
+    if alignment:
+
+        decision = "ZGODNY Z H1"
+
+        reason = (
+            "Kierunek sygnalu jest zgodny "
+            "z nachyleniem regresji H1, "
+            "a cena znajduje sie po "
+            "odpowiedniej stronie basis."
+        )
+
+    else:
+
+        decision = "WYMAGA OBSERWACJI"
+
+        reason = (
+            "Sygnal nie ma pelnego "
+            "potwierdzenia z tunelu H1. "
+            "Mozliwy ruch kontrtrendowy."
+        )
+
+    return {
+        "status": "READY",
+        "decision": decision,
+        "reason": reason,
+        "trend": trend,
+        "price": price,
+        "m15_basis": m15_basis,
+        "h1_basis": h1_basis,
+        "m15_upper": m15_reg["upper"],
+        "m15_lower": m15_reg["lower"],
+        "h1_upper": h1_reg["upper"],
+        "h1_lower": h1_reg["lower"],
+        "h1_slope": h1_slope,
+    }
+
+
+def telegram_market_analysis(signal, result):
+
+    if result["status"] != "READY":
+
+        return send_telegram_message(
+            "🧠 US100 V11 DEMO\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📊 ANALIZA RYNKU\n\n"
+            "⏳ Dane M15/H1 nie są jeszcze gotowe.\n\n"
+            "✅ Sygnał ENTRY / SL / TP "
+            "został obsłużony niezależnie.\n"
+            "🔒 Brak automatycznych transakcji."
+        )
+
+    message = (
+        "🧠 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 ANALIZA TUNELU REGRESJI\n\n"
+
+        f"📡 Sygnał: {signal['side']}\n"
+
+        f"💰 ENTRY strategii: "
+        f"{fmt_price(signal['strategy_entry'])}\n"
+
+        f"🛑 SL strategii: "
+        f"{fmt_price(signal['strategy_sl'])}\n"
+
+        f"🎯 TP strategii: "
+        f"{fmt_price(signal['strategy_tp'])}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 M15\n\n"
+
+        f"💵 Ostatnie zamknięcie: "
+        f"{fmt_price(result['price'])}\n"
+
+        f"🔹 Basis: "
+        f"{fmt_price(result['m15_basis'])}\n"
+
+        f"🔺 Górna banda: "
+        f"{fmt_price(result['m15_upper'])}\n"
+
+        f"🔻 Dolna banda: "
+        f"{fmt_price(result['m15_lower'])}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 H1\n\n"
+
+        f"🔹 Basis: "
+        f"{fmt_price(result['h1_basis'])}\n"
+
+        f"📈 Trend: {result['trend']}\n\n"
+
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🤖 OCENA ALGORYTMICZNA\n\n"
+
+        f"📌 {result['decision']}\n\n"
+
+        f"💬 {result['reason']}\n\n"
+
+        "ℹ️ Analiza informacyjna.\n"
+        "🔒 Nie otwarto transakcji."
+    )
+
+    return send_telegram_message(message)
+
+
+# ============================================================
+# PROCESS ALERT
+# ============================================================
+
+def process_strategy_alert(text):
+
+    print(
+        "[TV RAW]",
+        str(text)[:1000],
+        flush=True
+    )
+
+    signal = parse_strategy_alert(text)
+
+    print(
+        "[TV PARSED]",
+        signal,
+        flush=True
+    )
+
+    valid, reason = validate_signal(signal)
+
+    if not valid:
+
+        print(
+            "[TV REJECTED]",
+            reason,
+            flush=True
+        )
+
+        return
+
+    # =========================================
+    # 1. ZAPIS SYGNALU
+    # =========================================
+
+    with state_lock:
+
+        observer_state["signals_received"] += 1
+
+        observer_state["last_signal"] = signal
+
+        observer_state["last_signal_time"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
+
+    save_state()
+
+    # =========================================
+    # 2. TELEGRAM - ZAWSZE PIERWSZY
+    # =========================================
+
+    delivered = telegram_strategy_signal(
+        signal
+    )
+
+    print(
+        "[TV TELEGRAM SIGNAL]",
+        delivered,
+        flush=True
+    )
+
+    if delivered:
+
+        with state_lock:
+
+            observer_state["signals_forwarded"] += 1
+
+        save_state()
+
+    # =========================================
+    # 3. ANALIZA - NIEZALEZNA
+    # =========================================
+
+    try:
+
+        analysis = analyse_market(signal)
+
+        with state_lock:
+
+            observer_state["last_analysis"] = analysis
+
+        save_state()
+
+        telegram_market_analysis(
+            signal,
+            analysis
+        )
+
+    except Exception as error:
+
+        print(
+            "[ANALYSIS ERROR]",
+            error,
+            flush=True
+        )
+
+        send_telegram_message(
+            "⚠️ US100 V11 DEMO\n"
+            "Analiza rynku nie powiodła się.\n"
+            "Sygnał TradingView został "
+            "przetworzony osobno."
+        )
+
+
+# ============================================================
+# CTRADER MARKET DATA
+# ============================================================
 
 def request_trendbars(client, timeframe):
 
@@ -1697,10 +1073,6 @@ def request_trendbars(client, timeframe):
 
     if not symbol_id:
         return
-
-    now_ms = int(
-        time.time() * 1000
-    )
 
     req = ProtoOAGetTrendbarsReq()
 
@@ -1716,83 +1088,70 @@ def request_trendbars(client, timeframe):
         else ProtoOATrendbarPeriod.H1
     )
 
+    now_ms = int(time.time() * 1000)
+
+    days = (
+        35
+        if timeframe == "M15"
+        else 30
+    )
+
     req.fromTimestamp = (
-        now_ms - 14 * 86400000
+        now_ms - days * 86400000
     )
 
     req.toTimestamp = now_ms
-    req.count = 250
+
+    req.count = 1500
 
     client.send(req).addErrback(
         safe_errback
     )
 
 
-# ============================================================
-# ACCOUNT DATA
-# ============================================================
-
 def request_account_data(client):
 
     if not ctrader_state["account_authorized"]:
         return
 
-    account_id = int(
+    if market_state["US100"]["found"]:
+        return
+
+    req = ProtoOASymbolsListReq()
+
+    req.ctidTraderAccountId = int(
         ctrader_state["account_id"]
     )
 
-    if not market_state["US100"]["found"]:
+    req.includeArchivedSymbols = False
 
-        req = ProtoOASymbolsListReq()
+    client.send(req).addErrback(
+        safe_errback
+    )
 
-        req.ctidTraderAccountId = account_id
-
-        req.includeArchivedSymbols = False
-
-        client.send(req).addErrback(
-            safe_errback
-        )
-
-    for req in (
-        ProtoOATraderReq(),
-        ProtoOAReconcileReq(),
-        ProtoOAGetPositionUnrealizedPnLReq(),
-    ):
-
-        req.ctidTraderAccountId = account_id
-
-        client.send(req).addErrback(
-            safe_errback
-        )
-
-
-# ============================================================
-# REFRESH
-# ============================================================
 
 def refresh_market():
 
-    if (
-        ctrader_client is None
-        or not ctrader_state["account_authorized"]
-    ):
+    if ctrader_client is None:
         return
 
-    request_account_data(
-        ctrader_client
+    if not ctrader_state["account_authorized"]:
+        return
+
+    request_account_data(ctrader_client)
+
+    if market_state["US100"]["digits"] is None:
+        return
+
+    request_trendbars(
+        ctrader_client,
+        "M15"
     )
 
-    if market_state["US100"]["digits"] is not None:
-
-        request_trendbars(
-            ctrader_client,
-            "M15",
-        )
-
-        request_trendbars(
-            ctrader_client,
-            "H1",
-        )
+    request_trendbars(
+        ctrader_client,
+        "H1"
+    )
 
 
 def start_refresh_loop():
@@ -1810,17 +1169,17 @@ def start_refresh_loop():
 
         reactor.callLater(
             AUTO_REFRESH_SECONDS,
-            tick,
+            tick
         )
 
     reactor.callLater(
         5.0,
-        tick,
+        tick
     )
 
 
 # ============================================================
-# AUTH
+# CTRADER AUTH
 # ============================================================
 
 def send_account_list(client):
@@ -1828,6 +1187,9 @@ def send_account_list(client):
     token = ctrader_state["access_token"]
 
     if not token:
+
+        set_error("Brak access_token")
+
         return
 
     req = ProtoOAGetAccountListByAccessTokenReq()
@@ -1841,10 +1203,15 @@ def send_account_list(client):
 
 def authorize_account(client):
 
+    account_id = ctrader_state["account_id"]
+
+    if not account_id:
+        return
+
     req = ProtoOAAccountAuthReq()
 
     req.ctidTraderAccountId = int(
-        ctrader_state["account_id"]
+        account_id
     )
 
     req.accessToken = ctrader_state[
@@ -1875,22 +1242,22 @@ def start_ctrader_connection():
 
         return
 
-    # TYLKO DEMO
     ctrader_client = Client(
         EndPoints.PROTOBUF_DEMO_HOST,
         EndPoints.PROTOBUF_PORT,
-        TcpProtocol,
+        TcpProtocol
     )
 
     def connected(client):
 
         ctrader_state["connected"] = True
 
-        clear_error()
+        ctrader_state["error"] = None
 
         req = ProtoOAApplicationAuthReq()
 
         req.clientId = CTRADER_CLIENT_ID
+
         req.clientSecret = CTRADER_CLIENT_SECRET
 
         client.send(req).addErrback(
@@ -1901,21 +1268,21 @@ def start_ctrader_connection():
 
         ctrader_state["connected"] = False
 
-        ctrader_state[
-            "account_authorized"
-        ] = False
+        ctrader_state["account_authorized"] = False
 
-        set_error(
-            f"DISCONNECTED: {reason}"
+        ctrader_state["market_ready"] = False
+
+        print(
+            "[CTRADER DISCONNECTED]",
+            reason,
+            flush=True
         )
 
     def on_message(client, message):
 
         payload_type = message.payloadType
 
-        # ====================================
         # APPLICATION AUTH
-        # ====================================
 
         if payload_type == (
             ProtoOAApplicationAuthRes().payloadType
@@ -1927,9 +1294,7 @@ def start_ctrader_connection():
 
             send_account_list(client)
 
-        # ====================================
         # ACCOUNT LIST
-        # ====================================
 
         elif payload_type == (
             ProtoOAGetAccountListByAccessTokenRes().payloadType
@@ -1944,7 +1309,7 @@ def start_ctrader_connection():
                     getattr(
                         account,
                         "traderLogin",
-                        0,
+                        0
                     ) or 0
                 ) == TARGET_TRADER_LOGIN
             ]
@@ -1960,13 +1325,22 @@ def start_ctrader_connection():
 
             account = matches[0]
 
-            # TWARDY BLOK LIVE
             if bool(
-                getattr(account, "isLive", False)
+                getattr(
+                    account,
+                    "isLive",
+                    False
+                )
             ):
 
+                ctrader_state["account_id"] = None
+
+                ctrader_state[
+                    "account_authorized"
+                ] = False
+
                 set_error(
-                    "LIVE BLOCKED"
+                    "LIVE BLOCKED - DEMO ONLY"
                 )
 
                 return
@@ -1977,9 +1351,7 @@ def start_ctrader_connection():
 
             authorize_account(client)
 
-        # ====================================
         # ACCOUNT AUTH
-        # ====================================
 
         elif payload_type == (
             ProtoOAAccountAuthRes().payloadType
@@ -1989,15 +1361,13 @@ def start_ctrader_connection():
                 "account_authorized"
             ] = True
 
-            clear_error()
+            ctrader_state["error"] = None
 
             request_account_data(client)
 
             start_refresh_loop()
 
-        # ====================================
-        # DISCONNECT
-        # ====================================
+        # ACCOUNT DISCONNECT
 
         elif payload_type == (
             ProtoOAAccountDisconnectEvent().payloadType
@@ -2010,12 +1380,10 @@ def start_ctrader_connection():
             reactor.callLater(
                 1.0,
                 authorize_account,
-                client,
+                client
             )
 
-        # ====================================
         # TOKEN INVALID
-        # ====================================
 
         elif payload_type == (
             ProtoOAAccountsTokenInvalidatedEvent().payloadType
@@ -2026,166 +1394,10 @@ def start_ctrader_connection():
             ] = False
 
             set_error(
-                "Token wygasł. "
-                "Zaloguj ponownie przez /ctrader/login"
+                "Token wygasl - /ctrader/login"
             )
 
-        # ====================================
-        # TRADER
-        # ====================================
-
-        elif payload_type == (
-            ProtoOATraderRes().payloadType
-        ):
-
-            response = Protobuf.extract(message)
-
-            trader = response.trader
-
-            divisor = 10 ** trader.moneyDigits
-
-            ctrader_state["balance"] = round(
-                trader.balance / divisor,
-                2,
-            )
-
-        # ====================================
-        # PNL
-        # ====================================
-
-        elif payload_type == (
-            ProtoOAGetPositionUnrealizedPnLRes().payloadType
-        ):
-
-            response = Protobuf.extract(message)
-
-            divisor = 10 ** response.moneyDigits
-
-            pnl = sum(
-                x.netUnrealizedPnL
-                for x in response.positionUnrealizedPnL
-            ) / divisor
-
-            ctrader_state["unrealized_pnl"] = round(
-                pnl,
-                2,
-            )
-
-            if ctrader_state["balance"] is not None:
-
-                ctrader_state["equity"] = round(
-                    ctrader_state["balance"] + pnl,
-                    2,
-                )
-
-        # ====================================
-        # POSITIONS
-        # ====================================
-
-        elif payload_type == (
-            ProtoOAReconcileRes().payloadType
-        ):
-
-            response = Protobuf.extract(message)
-
-            positions = []
-
-            for position in response.position:
-
-                td = position.tradeData
-
-                side = (
-                    "LONG"
-                    if int(td.tradeSide)
-                    == int(ProtoOATradeSide.BUY)
-                    else "SHORT"
-                )
-
-                positions.append({
-                    "position_id": int(
-                        position.positionId
-                    ),
-                    "symbol_id": int(
-                        td.symbolId
-                    ),
-                    "volume_raw": int(
-                        td.volume
-                    ),
-                    "side_name": side,
-                    "label": str(
-                        getattr(td, "label", "") or ""
-                    ),
-                    "price": float(
-                        getattr(position, "price", 0) or 0
-                    ),
-                    "stop_loss": float(
-                        getattr(position, "stopLoss", 0) or 0
-                    ),
-                    "take_profit": float(
-                        getattr(position, "takeProfit", 0) or 0
-                    ),
-                })
-
-            ctrader_state["positions"] = positions
-
-            ctrader_state["orders"] = [
-                int(order.orderId)
-                for order in response.order
-            ]
-
-            # Potwierdzenie SL przez odczyt
-            # aktualnego stanu pozycji.
-            for position in positions:
-
-                pid = str(
-                    position["position_id"]
-                )
-
-                pending = pending_sl.get(pid)
-
-                if not pending:
-                    continue
-
-                actual_sl = float(
-                    position["stop_loss"]
-                )
-
-                requested_sl = float(
-                    pending["new"]
-                )
-
-                digits = (
-                    market_state["US100"]["digits"] or 2
-                )
-
-                tolerance = 10 ** (-digits)
-
-                if abs(
-                    actual_sl - requested_sl
-                ) <= tolerance:
-
-                    telegram_sl_changed(
-                        pending["side"],
-                        pending["old"],
-                        actual_sl,
-                        pending["reason"],
-                    )
-
-                    pending_sl.pop(
-                        pid,
-                        None,
-                    )
-
-            if ctrader_state["market_ready"]:
-
-                reactor.callLater(
-                    0.2,
-                    run_trade_manager,
-                )
-
-        # ====================================
-        # SYMBOL LIST
-        # ====================================
+        # SYMBOLS
 
         elif payload_type == (
             ProtoOASymbolsListRes().payloadType
@@ -2210,9 +1422,10 @@ def start_ctrader_connection():
                 return
 
             exact = [
-                s for s in candidates
+                symbol
+                for symbol in candidates
                 if normalize_symbol(
-                    s.symbolName
+                    symbol.symbolName
                 ) == "US100"
             ]
 
@@ -2248,9 +1461,7 @@ def start_ctrader_connection():
                 safe_errback
             )
 
-        # ====================================
         # SYMBOL DETAILS
-        # ====================================
 
         elif payload_type == (
             ProtoOASymbolByIdRes().payloadType
@@ -2263,43 +1474,24 @@ def start_ctrader_connection():
                 if int(symbol.symbolId) != int(
                     market_state["US100"]["symbol_id"]
                 ):
+
                     continue
 
-                data = market_state["US100"]
-
-                data["digits"] = int(
+                market_state["US100"]["digits"] = int(
                     symbol.digits
                 )
 
-                data["min_volume_raw"] = int(
-                    getattr(symbol, "minVolume", 0) or 0
-                )
-
-                data["max_volume_raw"] = int(
-                    getattr(symbol, "maxVolume", 0) or 0
-                )
-
-                data["step_volume_raw"] = int(
-                    getattr(symbol, "stepVolume", 0) or 0
-                )
-
-                data["lot_size_raw"] = int(
-                    getattr(symbol, "lotSize", 0) or 0
+                request_trendbars(
+                    client,
+                    "M15"
                 )
 
                 request_trendbars(
                     client,
-                    "M15",
+                    "H1"
                 )
 
-                request_trendbars(
-                    client,
-                    "H1",
-                )
-
-        # ====================================
         # TREND BARS
-        # ====================================
 
         elif payload_type == (
             ProtoOAGetTrendbarsRes().payloadType
@@ -2307,43 +1499,59 @@ def start_ctrader_connection():
 
             response = Protobuf.extract(message)
 
+            symbol_id = market_state[
+                "US100"
+            ]["symbol_id"]
+
+            if symbol_id is None:
+                return
+
             if int(response.symbolId) != int(
-                market_state["US100"]["symbol_id"]
+                symbol_id
             ):
+
                 return
 
-            timeframe = (
-                "M15"
-                if response.period
-                == ProtoOATrendbarPeriod.M15
-                else "H1"
-                if response.period
-                == ProtoOATrendbarPeriod.H1
-                else None
-            )
+            if response.period == (
+                ProtoOATrendbarPeriod.M15
+            ):
 
-            if timeframe is None:
+                timeframe = "M15"
+
+            elif response.period == (
+                ProtoOATrendbarPeriod.H1
+            ):
+
+                timeframe = "H1"
+
+            else:
+
                 return
 
-            digits = (
-                market_state["US100"]["digits"] or 2
-            )
+            digits = market_state[
+                "US100"
+            ]["digits"]
+
+            if digits is None:
+                return
 
             candles = [
                 trendbar_to_dict(
                     bar,
-                    digits,
+                    digits
                 )
                 for bar in response.trendbar
             ]
 
             candles.sort(
-                key=lambda x: x["timestamp"]
+                key=lambda candle: candle["timestamp"]
             )
 
-            market_state["US100"][
-                "candles"
-            ][timeframe] = candles
+            with market_lock:
+
+                market_state["US100"][
+                    "candles"
+                ][timeframe] = candles
 
             m15_ready = (
                 len(closed_candles("M15"))
@@ -2363,107 +1571,7 @@ def start_ctrader_connection():
                 "last_market_refresh"
             ] = int(time.time())
 
-            if ctrader_state["market_ready"]:
-
-                reactor.callLater(
-                    0.2,
-                    run_trade_manager,
-                )
-
-        # ====================================
-        # EXECUTION
-        # ====================================
-
-        elif payload_type == (
-            ProtoOAExecutionEvent().payloadType
-        ):
-
-            response = Protobuf.extract(message)
-
-            execution_type = int(
-                response.executionType
-            )
-
-            if execution_type == int(
-                ProtoOAExecutionType.ORDER_FILLED
-            ):
-
-                last = trade_state.get(
-                    "last_order"
-                ) or {}
-
-                if last.get("status") == "SENT":
-
-                    last["status"] = "FILLED"
-
-                    if response.HasField("position"):
-
-                        last["position_id"] = int(
-                            response.position.positionId
-                        )
-
-                        last["actual_entry"] = float(
-                            getattr(
-                                response.position,
-                                "price",
-                                0,
-                            ) or 0
-                        )
-
-                    trade_state[
-                        "pending_symbols"
-                    ].discard("US100")
-
-                    save_state()
-
-                reactor.callLater(
-                    0.5,
-                    request_account_data,
-                    client,
-                )
-
-            else:
-
-                reactor.callLater(
-                    0.5,
-                    request_account_data,
-                    client,
-                )
-
-        # ====================================
-        # ORDER ERROR
-        # ====================================
-
-        elif payload_type == (
-            ProtoOAOrderErrorEvent().payloadType
-        ):
-
-            response = Protobuf.extract(message)
-
-            trade_state[
-                "pending_symbols"
-            ].clear()
-
-            error_text = (
-                f"{response.errorCode}: "
-                f"{response.description}"
-            )
-
-            trade_state[
-                "last_order_error"
-            ] = error_text
-
-            set_error(error_text)
-
-            send_telegram_message(
-                "⚠️ US100 V11 DEMO\n"
-                "Błąd zlecenia cTrader:\n"
-                f"{error_text}"
-            )
-
-        # ====================================
         # GENERIC ERROR
-        # ====================================
 
         elif payload_type == (
             ProtoOAErrorRes().payloadType
@@ -2489,15 +1597,11 @@ def start_ctrader_connection():
                         "account_authorized"
                     ] = True
 
-                    request_account_data(
-                        client
-                    )
+                    request_account_data(client)
 
                 else:
 
-                    send_account_list(
-                        client
-                    )
+                    send_account_list(client)
 
                 return
 
@@ -2538,6 +1642,25 @@ def start_reactor():
     )
 
 
+def ensure_reactor():
+
+    if not reactor_started:
+
+        threading.Thread(
+            target=start_reactor,
+            daemon=True
+        ).start()
+
+    for _ in range(50):
+
+        if getattr(reactor, "running", False):
+            return True
+
+        time.sleep(0.1)
+
+    return False
+
+
 # ============================================================
 # BOOT
 # ============================================================
@@ -2550,24 +1673,12 @@ def bootstrap():
 
         print(
             "[BOOT] Login required: /ctrader/login",
-            flush=True,
+            flush=True
         )
 
         return
 
-    threading.Thread(
-        target=start_reactor,
-        daemon=True,
-    ).start()
-
-    for _ in range(50):
-
-        if reactor.running:
-            break
-
-        time.sleep(0.1)
-
-    if reactor.running:
+    if ensure_reactor():
 
         reactor.callFromThread(
             start_ctrader_connection
@@ -2582,10 +1693,12 @@ def bootstrap():
 def home():
 
     return jsonify({
-        "bot": "US100 V11 DEMO",
+        "bot": BOT_NAME,
         "status": "ONLINE",
+        "version": "V11",
+        "mode": "SIGNAL_OBSERVER",
         "demo_only": True,
-        "trading_enabled": ENABLE_DEMO_TRADING,
+        "trading_enabled": False,
         "target_trader_login": TARGET_TRADER_LOGIN,
         "fixed_lots_us100": FIXED_LOTS_US100,
         "emergency_sl_pct": EMERGENCY_SL_PCT * 100,
@@ -2596,10 +1709,7 @@ def home():
         "market_ready": ctrader_state[
             "market_ready"
         ],
-        "balance": ctrader_state["balance"],
-        "equity": ctrader_state["equity"],
-        "last_order": trade_state["last_order"],
-        "manager_state": manager_state,
+        "observer": observer_state,
         "error": ctrader_state["error"],
     })
 
@@ -2611,6 +1721,7 @@ def health():
         "status": "ok",
         "version": "V11",
         "demo_only": True,
+        "trading_enabled": False,
     })
 
 
@@ -2628,9 +1739,9 @@ def ctrader_status():
         "market_ready": ctrader_state[
             "market_ready"
         ],
-        "balance": ctrader_state["balance"],
-        "equity": ctrader_state["equity"],
-        "positions": ctrader_state["positions"],
+        "last_market_refresh": ctrader_state[
+            "last_market_refresh"
+        ],
         "last_error": ctrader_state["error"],
     })
 
@@ -2639,15 +1750,49 @@ def ctrader_status():
 def trade_status():
 
     return jsonify({
-        "trading_enabled": ENABLE_DEMO_TRADING,
-        "positions": ctrader_state["positions"],
-        "last_order": trade_state["last_order"],
-        "last_order_error": trade_state[
-            "last_order_error"
+        "trading_enabled": False,
+        "mode": "OBSERVER_ONLY",
+        "last_signal": observer_state[
+            "last_signal"
         ],
-        "manager_state": manager_state,
-        "pending_sl": pending_sl,
-        "pending_close": pending_close,
+        "last_analysis": observer_state[
+            "last_analysis"
+        ],
+        "message": (
+            "Ta wersja nie wysyla zlecen "
+            "do cTrader."
+        ),
+    })
+
+
+@app.route("/ai/status")
+def ai_status():
+
+    return jsonify({
+        "mode": "ALGORITHMIC_ANALYSIS",
+        "external_ai_enabled": False,
+        "observer": observer_state,
+    })
+
+
+@app.route("/market")
+def market():
+
+    m15 = closed_candles("M15")
+
+    h1 = closed_candles("H1")
+
+    return jsonify({
+        "market_ready": ctrader_state[
+            "market_ready"
+        ],
+        "symbol": market_state[
+            "US100"
+        ]["symbol_name"],
+        "m15_bars": len(m15),
+        "h1_bars": len(h1),
+        "M15_regression": regression_channel(m15),
+        "H1_regression": regression_channel(h1),
     })
 
 
@@ -2657,27 +1802,35 @@ def telegram_test():
     ok = send_telegram_message(
         "🧪 US100 V11 DEMO\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "✅ Telegram działa poprawnie!\n\n"
+        "✅ Telegram działa!\n\n"
         "📊 Instrument: US100\n"
-        "📦 Wolumen: 2.00 lot\n"
+        "📦 Wolumen planowany: 2.00 lot\n"
         "🛑 Awaryjny SL: 0.70%\n"
-        "🎯 TP: poziom strategii\n"
-        "🤖 Manager: M15 → H1\n\n"
-        "🔒 Konto DEMO: 5901967"
+        "🎯 ENTRY / SL / TP: TradingView\n"
+        "🤖 Analiza: M15 + H1\n\n"
+        "🔒 HANDEL WYŁĄCZONY"
     )
 
     return jsonify({
         "status": (
-            "success" if ok else "error"
+            "success"
+            if ok
+            else "error"
         ),
         "telegram_sent": ok,
     })
 
 
-@app.route("/webhook", methods=["POST"])
+# ============================================================
+# WEBHOOK - ADRES BEZ ZMIAN
+# ============================================================
+
+@app.route(
+    "/webhook",
+    methods=["POST"]
+)
 def webhook():
 
-    # Sekret jest wymagany.
     if not WEBHOOK_SECRET:
 
         return jsonify({
@@ -2703,7 +1856,10 @@ def webhook():
             text = (
                 data.get("message")
                 or data.get("text")
-                or json.dumps(data)
+                or json.dumps(
+                    data,
+                    ensure_ascii=False
+                )
             )
 
         else:
@@ -2716,30 +1872,42 @@ def webhook():
             as_text=True
         )
 
-    if not text.strip():
+    if not str(text).strip():
 
         return jsonify({
             "status": "error",
             "message": "empty alert",
         }), 400
 
+    # Nie czekamy na cTrader.
+    # Nie czekamy na regresje.
+    # Nie sprawdzamy ENABLE_DEMO_TRADING.
+
     threading.Thread(
         target=process_strategy_alert,
         args=(text,),
-        daemon=True,
+        daemon=True
     ).start()
 
     return jsonify({
         "status": "accepted",
         "version": "V11",
-        "demo_only": True,
-    })
+        "mode": "SIGNAL_OBSERVER",
+        "trading": False,
+    }), 200
 
+
+# ============================================================
+# MARKET REFRESH
+# ============================================================
 
 @app.route("/market/refresh")
 def market_refresh():
 
-    if not ctrader_state["account_authorized"]:
+    if (
+        ctrader_client is None
+        or not ctrader_state["account_authorized"]
+    ):
 
         return jsonify({
             "status": "error",
@@ -2755,25 +1923,27 @@ def market_refresh():
     })
 
 
+# ============================================================
+# MANAGER STATUS
+# ============================================================
+
 @app.route("/manager/run")
 def manager_run():
 
-    if not ctrader_state["account_authorized"]:
-
-        return jsonify({
-            "status": "error",
-            "message": "cTrader not authorized",
-        }), 503
-
-    reactor.callFromThread(
-        run_trade_manager
-    )
-
     return jsonify({
-        "status": "manager_started",
-        "demo_only": True,
+        "status": "disabled",
+        "version": "V11",
+        "mode": "OBSERVER_ONLY",
+        "message": (
+            "Manager transakcji jest "
+            "wylaczony w tej wersji."
+        ),
     })
 
+
+# ============================================================
+# CTRADER LOGIN
+# ============================================================
 
 @app.route("/ctrader/login")
 def ctrader_login():
@@ -2781,7 +1951,7 @@ def ctrader_login():
     if not all((
         CTRADER_CLIENT_ID,
         CTRADER_CLIENT_SECRET,
-        CTRADER_REDIRECT_URI,
+        CTRADER_REDIRECT_URI
     )):
 
         return jsonify({
@@ -2796,7 +1966,7 @@ def ctrader_login():
         + urlencode({
             "client_id": CTRADER_CLIENT_ID,
             "redirect_uri": CTRADER_REDIRECT_URI,
-            "scope": "trading",
+            "scope": "accounts",
             "product": "web",
         })
     )
@@ -2825,7 +1995,7 @@ def ctrader_callback():
                 "client_id": CTRADER_CLIENT_ID,
                 "client_secret": CTRADER_CLIENT_SECRET,
             },
-            timeout=15,
+            timeout=15
         )
 
         response.raise_for_status()
@@ -2840,6 +2010,12 @@ def ctrader_callback():
             data.get("refreshToken")
         )
 
+        if not ctrader_state["access_token"]:
+
+            raise RuntimeError(
+                "Brak accessToken"
+            )
+
         save_state()
 
     except Exception as error:
@@ -2851,14 +2027,12 @@ def ctrader_callback():
             "message": "Token error",
         }), 500
 
-    if not reactor_started:
+    if not ensure_reactor():
 
-        threading.Thread(
-            target=start_reactor,
-            daemon=True,
-        ).start()
-
-        time.sleep(0.5)
+        return jsonify({
+            "status": "error",
+            "message": "Reactor not running",
+        }), 503
 
     reactor.callFromThread(
         start_ctrader_connection
@@ -2867,8 +2041,9 @@ def ctrader_callback():
     return jsonify({
         "status": "success",
         "route": "DEMO",
-        "target_trader_login": TARGET_TRADER_LOGIN,
         "version": "V11",
+        "trading_enabled": False,
+        "target_trader_login": TARGET_TRADER_LOGIN,
     })
 
 
@@ -2878,17 +2053,17 @@ def ctrader_callback():
 
 threading.Thread(
     target=bootstrap,
-    daemon=True,
+    daemon=True
 ).start()
 
 
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", "10000")
+        os.getenv("PORT", "10000")
     )
 
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=port
     )
