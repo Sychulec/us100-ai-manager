@@ -185,6 +185,277 @@ def send_telegram_message(text):
     except Exception as error:
         print("[TELEGRAM ERROR]", error, flush=True)
         return False
+        # ============================================================
+# US100 V11 - TELEGRAM NOTIFICATIONS
+# DEMO ONLY - 5901967
+# ============================================================
+
+def fmt_price(value):
+    if value is None:
+        return "Brak danych"
+    try:
+        return f"{float(value):,.2f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "Brak danych"
+
+
+def fmt_money(value):
+    if value is None:
+        return "Brak danych"
+    try:
+        return f"{float(value):+,.2f}".replace(",", " ")
+    except (TypeError, ValueError):
+        return "Brak danych"
+
+
+def telegram_signal(signal, emergency_sl, lots):
+    """
+    Informacja o sygnale TradingView.
+    Nie oznacza jeszcze otwarcia pozycji.
+    """
+
+    side = signal.get("side", "?")
+
+    message = (
+        "📥 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📡 SYGNAŁ TRADINGVIEW\n\n"
+
+        f"{'🟢' if side == 'LONG' else '🔴'} "
+        f"Kierunek: {side}\n"
+
+        f"📊 Interwał: {signal.get('timeframe', 'M15')}\n"
+        f"💰 Cena strategii: "
+        f"{fmt_price(signal.get('strategy_entry'))}\n"
+
+        f"🛑 SL strategii: "
+        f"{fmt_price(signal.get('strategy_sl'))}\n"
+
+        f"🎯 TP strategii: "
+        f"{fmt_price(signal.get('strategy_tp'))}\n\n"
+
+        f"🚨 Awaryjny SL: {fmt_price(emergency_sl)}\n"
+        f"📦 Wolumen: {lots:.2f} lot\n\n"
+
+        "⏳ Wysyłanie zlecenia do cTrader DEMO...\n"
+        "ℹ️ TP jest tylko poziomem orientacyjnym."
+    )
+
+    return send_telegram_message(message)
+
+
+def telegram_position_opened(
+    side,
+    entry,
+    lots,
+    stop_loss,
+    strategy_tp=None,
+    position_id=None,
+):
+    """
+    Wywoływać dopiero po potwierdzeniu
+    otwarcia pozycji przez cTrader.
+    """
+
+    message = (
+        "✅ US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📈 POZYCJA OTWARTA\n\n"
+
+        f"{'🟢' if side == 'LONG' else '🔴'} "
+        f"Kierunek: {side}\n"
+
+        f"💰 Cena wejścia: {fmt_price(entry)}\n"
+        f"📦 Wolumen: {lots:.2f} lot\n\n"
+
+        f"🛑 Aktualny SL: {fmt_price(stop_loss)}\n"
+        f"🎯 TP strategii: {fmt_price(strategy_tp)}\n\n"
+
+        "🤖 MANAGER REGRESJI\n"
+        "📊 Faza: M15\n"
+        "➡️ Po osiągnięciu basis M15 przejście na H1.\n\n"
+
+        "ℹ️ Brak sztywnego TP w cTrader."
+    )
+
+    if position_id is not None:
+        message += f"\n🆔 Pozycja: {position_id}"
+
+    return send_telegram_message(message)
+
+
+def telegram_sl_changed(
+    side,
+    old_sl,
+    new_sl,
+    reason,
+):
+    """
+    Potwierdzona zmiana Stop Loss.
+    """
+
+    message = (
+        "🛡️ US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔄 ZMIANA STOP LOSS\n\n"
+
+        f"📈 Kierunek: {side}\n\n"
+
+        f"🔴 Poprzedni SL: {fmt_price(old_sl)}\n"
+        f"🟢 Nowy SL: {fmt_price(new_sl)}\n\n"
+
+        f"📊 Powód: {reason}\n\n"
+
+        "🤖 Manager tunelu regresji"
+    )
+
+    return send_telegram_message(message)
+
+
+def telegram_basis_reached(
+    side,
+    basis,
+    current_sl,
+):
+    """
+    Informacja o przejściu z M15 na H1.
+    """
+
+    message = (
+        "🤖 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 MANAGER - ZMIANA FAZY\n\n"
+
+        f"📈 Kierunek: {side}\n"
+        "✅ M15: basis osiągnięty\n\n"
+
+        f"🎯 Basis M15: {fmt_price(basis)}\n"
+        f"🛑 Ostatni znany SL: {fmt_price(current_sl)}\n\n"
+
+        "➡️ H1 PRZEJMUJE PROWADZENIE\n\n"
+
+        "Od teraz manager kontroluje:\n"
+        "• zamknięcia świec H1,\n"
+        "• położenie ceny względem basis,\n"
+        "• przesuwanie SL po strukturze H1."
+    )
+
+    return send_telegram_message(message)
+
+
+def telegram_position_analysis(
+    side,
+    entry,
+    current_price,
+    stop_loss,
+    strategy_tp,
+    m15_reg,
+    h1_reg,
+    pnl=None,
+):
+    """
+    Analiza na podstawie tunelu regresji.
+    Nie podejmuje decyzji o zamknięciu.
+    """
+
+    m15_status = "Brak danych"
+    h1_status = "Brak danych"
+
+    if m15_reg and current_price is not None:
+        if current_price >= m15_reg["basis"]:
+            m15_status = "Powyżej środka tunelu"
+        else:
+            m15_status = "Poniżej środka tunelu"
+
+    if h1_reg and current_price is not None:
+        if current_price >= h1_reg["basis"]:
+            h1_status = "Powyżej środka tunelu"
+        else:
+            h1_status = "Poniżej środka tunelu"
+
+    h1_trend = "Brak danych"
+
+    if h1_reg:
+        slope = h1_reg["slope"]
+
+        if slope > 0:
+            h1_trend = "WZROSTOWY 📈"
+        elif slope < 0:
+            h1_trend = "SPADKOWY 📉"
+        else:
+            h1_trend = "BOCZNY ➡️"
+
+    message = (
+        "🧠 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "📊 ANALIZA OTWARTEJ POZYCJI\n\n"
+
+        f"📈 Kierunek: {side}\n"
+        f"💰 Wejście: {fmt_price(entry)}\n"
+        f"💵 Cena aktualna: {fmt_price(current_price)}\n\n"
+
+        f"🛑 Aktualny SL: {fmt_price(stop_loss)}\n"
+        f"🎯 TP strategii: {fmt_price(strategy_tp)}\n"
+    )
+
+    if pnl is not None:
+        message += f"💰 Wynik pozycji: {fmt_money(pnl)}\n"
+
+    message += (
+        "\n📊 TUNEL REGRESJI\n\n"
+
+        f"🔹 M15: {m15_status}\n"
+        f"🔹 H1: {h1_status}\n"
+        f"📈 Trend H1: {h1_trend}\n\n"
+    )
+
+    if not h1_reg:
+        conclusion = "Oczekiwanie na dane H1."
+    elif side == "LONG" and h1_reg["slope"] > 0:
+        conclusion = "Trend H1 wspiera pozycję LONG."
+    elif side == "SHORT" and h1_reg["slope"] < 0:
+        conclusion = "Trend H1 wspiera pozycję SHORT."
+    else:
+        conclusion = "Uwaga: trend H1 nie wspiera kierunku pozycji."
+
+    message += (
+        f"🤖 OCENA:\n{conclusion}\n\n"
+        "ℹ️ Analiza informacyjna. "
+        "Decyzje wykonuje manager strategii."
+    )
+
+    return send_telegram_message(message)
+
+
+def telegram_position_closed(
+    side,
+    entry,
+    close_price,
+    pnl,
+    reason,
+):
+    """
+    Informacja o zamkniętej pozycji.
+    Wywoływać po potwierdzeniu wykonania.
+    """
+
+    message = (
+        "🏁 US100 V11 DEMO\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔴 POZYCJA ZAMKNIĘTA\n\n"
+
+        f"📈 Kierunek: {side}\n"
+        f"💰 Cena wejścia: {fmt_price(entry)}\n"
+        f"💵 Cena zamknięcia: {fmt_price(close_price)}\n\n"
+
+        f"💰 Wynik: {fmt_money(pnl)}\n\n"
+
+        f"📋 Powód: {reason}\n\n"
+
+        "✅ Koniec zarządzania pozycją."
+    )
+
+    return send_telegram_message(message)
 
 # ============================================================
 # SAVE / LOAD
